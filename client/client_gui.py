@@ -183,8 +183,11 @@ class ImageEditorClient:
                     text = f"⚪ {status}"
                 self.root.after(0, lambda: self.server_status.config(text=text))
             except Exception as exc:  # noqa: BLE001
+                # Bind the message now — `exc` is cleared when the except block
+                # ends, but this lambda runs later on the Tk main thread.
+                msg = str(exc)
                 self.root.after(
-                    0, lambda: self.server_status.config(text=f"🔴 Unreachable: {exc}")
+                    0, lambda: self.server_status.config(text=f"🔴 Unreachable: {msg}")
                 )
 
         threading.Thread(target=worker, daemon=True).start()
