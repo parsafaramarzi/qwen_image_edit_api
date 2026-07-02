@@ -31,7 +31,7 @@ except ImportError:
     raise SystemExit(1)
 
 
-DEFAULT_SERVER_URL = os.environ.get("QIE_SERVER_URL", "http://localhost:8000")
+DEFAULT_SERVER_URL = os.environ.get("QIE_SERVER_URL", "http://193.93.169.217:8000")
 DEFAULT_API_KEY = os.environ.get("QIE_API_KEY", "")
 
 
