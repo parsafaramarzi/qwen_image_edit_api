@@ -34,6 +34,23 @@ except ImportError:
 DEFAULT_SERVER_URL = os.environ.get("QIE_SERVER_URL", "http://193.93.169.217:8000")
 DEFAULT_API_KEY = os.environ.get("QIE_API_KEY", "")
 
+# Fixed, curated model list. Each entry is (label, model_id, precision, gguf_quant).
+# Keeping this closed avoids users typing bad repo ids or unsupported quants.
+MODEL_PRESETS = [
+    ("Qwen Image Edit 2511 — GGUF Q6_K (recommended)",
+     "Qwen/Qwen-Image-Edit-2511", "gguf", "Q6_K"),
+    ("Qwen Image Edit 2511 — GGUF Q5_K_M (less VRAM)",
+     "Qwen/Qwen-Image-Edit-2511", "gguf", "Q5_K_M"),
+    ("Qwen Image Edit 2511 — GGUF Q8_0 (max quality, tight)",
+     "Qwen/Qwen-Image-Edit-2511", "gguf", "Q8_0"),
+    ("Qwen Image Edit 2511 — full bf16 (best, slow)",
+     "Qwen/Qwen-Image-Edit-2511", "max", ""),
+    ("Qwen Image Edit 2509 — 4-bit (fast)",
+     "Qwen/Qwen-Image-Edit-2509", "4bit", ""),
+    ("Qwen Image Edit (original) — 4-bit (fast)",
+     "Qwen/Qwen-Image-Edit", "4bit", ""),
+]
+
 
 class ImageEditorClient:
     """Tkinter client for the Qwen Image Edit API."""
@@ -80,30 +97,18 @@ class ImageEditorClient:
         self.connect_btn = ttk.Button(self.server_frame, text="🔌 Check", command=self.check_server)
         self.server_status = ttk.Label(self.server_frame, text="⚪ Not checked", font=("Arial", 9))
 
-        # Model selection bar
+        # Model selection bar — a fixed, curated list (read-only).
         self.model_frame = ttk.LabelFrame(self.main_frame, text="🧠 Model", padding="5")
         ttk.Label(self.model_frame, text="Model:").grid(row=0, column=0, sticky="w")
         self.model_var = tk.StringVar(value="")
-        # Editable combobox: pick a preset or type any HF repo id.
-        self.model_combo = ttk.Combobox(self.model_frame, textvariable=self.model_var, width=40)
-        self.verify_btn = ttk.Button(self.model_frame, text="🔎 Verify", command=self.verify_model)
-        ttk.Label(self.model_frame, text="Precision:").grid(row=0, column=3, sticky="w", padx=(10, 0))
-        self.precision_var = tk.StringVar(value="gguf")
-        self.precision_combo = ttk.Combobox(
-            self.model_frame, textvariable=self.precision_var, width=7, state="readonly",
-            values=["gguf", "4bit", "8bit", "bf16", "max"],
+        self.model_combo = ttk.Combobox(
+            self.model_frame, textvariable=self.model_var, width=52, state="readonly"
         )
-        ttk.Label(self.model_frame, text="GGUF quant:").grid(row=0, column=5, sticky="w", padx=(10, 0))
-        self.gguf_quant_var = tk.StringVar(value="Q6_K")
-        self.gguf_quant_entry = ttk.Entry(self.model_frame, textvariable=self.gguf_quant_var, width=8)
         self.load_model_btn = ttk.Button(self.model_frame, text="⬇️ Load", command=self.load_model)
         self.downloads_btn = ttk.Button(self.model_frame, text="🗂 Downloads", command=self.open_downloads)
         self.model_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
-        # Maps the combobox label → (model_id, precision) from /models.
-        self._model_presets: dict = {}
         self._cached_ids: set = set()
-        # When a preset is chosen, sync the precision box to its suggestion.
-        self.model_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+        self._refresh_model_choices()  # populate from the fixed list (works offline)
 
         # Input
         self.input_frame = ttk.LabelFrame(self.main_frame, text="📥 Input Image", padding="5")
@@ -157,12 +162,9 @@ class ImageEditorClient:
 
         self.model_frame.pack(fill=tk.X, pady=(0, 10))
         self.model_combo.grid(row=0, column=1, padx=5)
-        self.verify_btn.grid(row=0, column=2, padx=2)
-        self.precision_combo.grid(row=0, column=4, padx=5)
-        self.gguf_quant_entry.grid(row=0, column=6, padx=5)
-        self.load_model_btn.grid(row=0, column=7, padx=5)
-        self.downloads_btn.grid(row=0, column=8, padx=2)
-        self.model_status.grid(row=0, column=9, padx=10, sticky="w")
+        self.load_model_btn.grid(row=0, column=2, padx=5)
+        self.downloads_btn.grid(row=0, column=3, padx=2)
+        self.model_status.grid(row=0, column=4, padx=10, sticky="w")
 
         content_frame = ttk.Frame(self.main_frame)
         content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -232,72 +234,46 @@ class ImageEditorClient:
     # ------------------------------------------------------------------ #
     # Model selection
     # ------------------------------------------------------------------ #
+    def _current_preset(self):
+        """Return the MODEL_PRESETS tuple for the current dropdown selection."""
+        idx = self.model_combo.current()
+        if 0 <= idx < len(MODEL_PRESETS):
+            return MODEL_PRESETS[idx]
+        return None
+
+    def _refresh_model_choices(self) -> None:
+        """Rebuild the dropdown labels from the fixed list, marking cached ones.
+
+        ✅ = already downloaded on the server, ⬇ = will download on first load.
+        Works offline (before the server is reachable) using the fixed list.
+        """
+        idx = self.model_combo.current()
+        labels = []
+        for label, model_id, _precision, _quant in MODEL_PRESETS:
+            mark = "✅ " if model_id in self._cached_ids else "⬇ "
+            labels.append(mark + label)
+        self.model_combo["values"] = labels
+        # Preserve the current selection, else default to the first (recommended).
+        self.model_combo.current(idx if idx >= 0 else 0)
+
     def _fetch_models(self) -> None:
-        """Populate the model dropdown from /models, marking downloaded ones."""
+        """Fetch the server's cache to mark which fixed presets are downloaded."""
         def worker():
             try:
                 resp = requests.get(
-                    f"{self.base_url()}/models", headers=self.auth_headers(), timeout=10
+                    f"{self.base_url()}/cache", headers=self.auth_headers(), timeout=10
                 )
                 resp.raise_for_status()
-                items = resp.json().get("models", [])
+                cached = {m["repo_id"] for m in resp.json().get("models", [])}
             except Exception:
-                return  # leave the combobox as free-text only
-
-            presets = {}
-            labels = []
-            cached_ids = set()
-            for it in items:
-                base = it.get("label") or it.get("model_id", "")
-                is_cached = it.get("cached", False)
-                if is_cached:
-                    cached_ids.add(it.get("model_id", ""))
-                # ✅ = already downloaded, ⬇ = will download on load.
-                mark = "✅ " if is_cached else "⬇ "
-                label = mark + base
-                presets[label] = (it.get("model_id", ""), it.get("precision", "gguf"))
-                labels.append(label)
-
-            def apply():
-                self._model_presets = presets
-                self._cached_ids = cached_ids
-                self.model_combo["values"] = labels
-                if labels and not self.model_var.get():
-                    self.model_combo.set(labels[0])
-                    self._on_preset_selected()
-            self.root.after(0, apply)
+                return  # offline — keep the plain fixed list
+            self.root.after(0, lambda: self._set_cached(cached))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def verify_model(self) -> None:
-        """Ask the server whether the typed/selected model repo exists on HF."""
-        model_id = self._selected_model_id()
-        if not model_id:
-            messagebox.showwarning("No Model", "Type a model id or pick a preset first.")
-            return
-        self.model_status.config(text="🔎 Verifying…")
-
-        def worker():
-            try:
-                resp = requests.post(
-                    f"{self.base_url()}/validate", json={"model_id": model_id},
-                    headers=self.auth_headers(), timeout=20,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                self.root.after(0, lambda: self.model_status.config(text=f"🔴 {msg}"))
-                return
-
-            if data.get("exists"):
-                dl = "already downloaded" if data.get("cached") else "needs download"
-                text = f"🟢 Found ({dl})"
-            else:
-                text = f"🔴 {data.get('message', 'Not found')}"
-            self.root.after(0, lambda: self.model_status.config(text=text))
-
-        threading.Thread(target=worker, daemon=True).start()
+    def _set_cached(self, cached: set) -> None:
+        self._cached_ids = cached
+        self._refresh_model_choices()
 
     def open_downloads(self) -> None:
         """Popup listing downloaded models with sizes and a delete option."""
@@ -380,29 +356,18 @@ class ImageEditorClient:
         ttk.Button(btns, text="🗑 Delete selected", command=delete_selected).pack(side=tk.LEFT, padx=5)
         refresh()
 
-    def _on_preset_selected(self, _event=None) -> None:
-        """When a preset label is picked, sync precision to its suggestion."""
-        preset = self._model_presets.get(self.model_var.get())
-        if preset:
-            self.precision_var.set(preset[1])
-
-    def _selected_model_id(self) -> str:
-        """Resolve the field to a model id (a preset label maps to its repo id)."""
-        value = self.model_var.get().strip()
-        preset = self._model_presets.get(value)
-        return preset[0] if preset else value
-
     def load_model(self) -> None:
-        """POST /load then poll /health until the new model is ready."""
-        model_id = self._selected_model_id()
-        if not model_id:
-            messagebox.showwarning("No Model", "Pick a preset or type a model id first.")
+        """POST /load for the selected preset, then poll /health until ready."""
+        preset = self._current_preset()
+        if preset is None:
+            messagebox.showwarning("No Model", "Pick a model from the list first.")
             return
+        _label, model_id, precision, gguf_quant = preset
 
         payload = {
             "model_id": model_id,
-            "precision": self.precision_var.get().strip(),
-            "gguf_quant": self.gguf_quant_var.get().strip() or None,
+            "precision": precision,
+            "gguf_quant": gguf_quant or None,
         }
         self.load_model_btn.config(state="disabled")
         self.model_status.config(text="⏳ Requesting load…")
