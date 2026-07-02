@@ -44,10 +44,11 @@ Precision is configurable through the ``QIE_PRECISION`` environment variable:
 from __future__ import annotations
 
 import gc
+import inspect
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -67,6 +68,17 @@ try:
     from diffusers import QwenImageEditPlusPipeline
 except ImportError:  # pragma: no cover - older diffusers
     QwenImageEditPlusPipeline = None
+
+# For non-Qwen models (FLUX Kontext, SD/SDXL img2img, InstructPix2Pix, ...) we
+# let diffusers auto-detect the right image-to-image pipeline class.
+try:
+    from diffusers import AutoPipelineForImage2Image
+except ImportError:  # pragma: no cover - older diffusers
+    AutoPipelineForImage2Image = None
+
+
+def _is_qwen_edit(model_id: str) -> bool:
+    return "qwen-image-edit" in model_id.lower() or "qwen_image_edit" in model_id.lower()
 
 
 # Default model. Override with QIE_MODEL_ID. Qwen-Image-Edit-2511 is the latest
@@ -119,8 +131,13 @@ def _select_device() -> str:
     return "cpu"
 
 
-def _build_quant_config(precision: str):
-    """Return a diffusers PipelineQuantizationConfig, or None for bf16."""
+def _build_quant_config(precision: str, components: Optional[list] = None):
+    """Return a diffusers PipelineQuantizationConfig, or None for bf16.
+
+    ``components`` restricts which submodules are quantized (e.g. the Qwen
+    transformer + text encoder). Pass None to quantize all quantizable modules,
+    which is safer for non-Qwen architectures whose component names differ.
+    """
     if precision not in ("4bit", "8bit"):
         return None
 
@@ -152,13 +169,12 @@ def _build_quant_config(precision: str):
         quant_kwargs = {"load_in_8bit": True}
         backend = "bitsandbytes_8bit"
 
-    return PipelineQuantizationConfig(
-        quant_backend=backend,
-        quant_kwargs=quant_kwargs,
-        # The transformer and text encoder are the memory hogs; the VAE is tiny
-        # and quantizing it hurts quality, so leave it in bf16.
-        components_to_quantize=["transformer", "text_encoder"],
-    )
+    kwargs = {"quant_backend": backend, "quant_kwargs": quant_kwargs}
+    if components:
+        # Restrict to the given components (e.g. Qwen transformer + text encoder);
+        # leave the small VAE in bf16 since quantizing it hurts quality.
+        kwargs["components_to_quantize"] = components
+    return PipelineQuantizationConfig(**kwargs)
 
 
 # GGUF defaults. Q6_K is the sweet spot for a 24 GB GPU: ~17 GB, near-full
@@ -200,13 +216,19 @@ def _resolve_gguf_filename(repo: str, explicit: str, quant: str) -> str:
     return sorted(matches, key=len)[0]
 
 
-def _build_gguf_pipeline(model_id: str):
+def _build_gguf_pipeline(model_id: str, repo: str, file: str, quant: str, base: str):
     """Load a GGUF-quantized transformer + the rest of the pipeline from HF.
 
-    Requires a recent diffusers (the 2511 GGUF loader fix landed in
-    huggingface/diffusers PR #12894 — a released version may be too old, in
-    which case install from git) and the ``gguf`` package.
+    Currently GGUF is supported only for Qwen-Image-Edit models. Requires a
+    recent diffusers (the 2511 GGUF loader fix landed in huggingface/diffusers
+    PR #12894) and the ``gguf`` package.
     """
+    if not _is_qwen_edit(model_id) and not _is_qwen_edit(base):
+        raise RuntimeError(
+            "GGUF precision currently supports only Qwen-Image-Edit models. "
+            "For other models pick precision 4bit/8bit/bf16."
+        )
+
     try:
         from diffusers import GGUFQuantizationConfig, QwenImageTransformer2DModel
     except ImportError as exc:  # pragma: no cover
@@ -226,16 +248,13 @@ def _build_gguf_pipeline(model_id: str):
 
     # The GGUF file only holds the transformer; the text encoder, VAE, tokenizer
     # and config come from the base HF repo.
-    base_model = os.environ.get("QIE_GGUF_BASE", model_id)
+    base_model = base or model_id
     if base_model.lower() in ("qwen/qwen-image-edit", ""):
-        # A GGUF repo is 2511/2509-based; default the base to 2511 so configs match.
         base_model = "Qwen/Qwen-Image-Edit-2511"
 
-    filename = _resolve_gguf_filename(
-        DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE, DEFAULT_GGUF_QUANT
-    )
-    print(f"📥 Fetching GGUF transformer {DEFAULT_GGUF_REPO}/{filename} ...")
-    gguf_path = hf_hub_download(repo_id=DEFAULT_GGUF_REPO, filename=filename)
+    filename = _resolve_gguf_filename(repo, file, quant)
+    print(f"📥 Fetching GGUF transformer {repo}/{filename} ...")
+    gguf_path = hf_hub_download(repo_id=repo, filename=filename)
 
     print(f"🔧 Loading GGUF transformer (base config: {base_model}) ...")
     transformer = QwenImageTransformer2DModel.from_single_file(
@@ -251,11 +270,16 @@ def _build_gguf_pipeline(model_id: str):
         transformer=transformer,
         torch_dtype=torch.bfloat16,
     )
-    return pipeline
+    return pipeline, base_model
 
 
 class ModelManager:
-    """Owns the pipeline lifecycle and serialises inference calls."""
+    """Owns the pipeline lifecycle and serialises inference calls.
+
+    Supports switching models at runtime via ``reload()`` and loading arbitrary
+    diffusers image-to-image models (not just Qwen) via
+    ``AutoPipelineForImage2Image``.
+    """
 
     def __init__(
         self,
@@ -264,7 +288,15 @@ class ModelManager:
     ) -> None:
         self.state = LoadState(model_id=model_id, precision=precision)
         self._pipeline = None
-        self._is_plus = False  # True when running a 2509/2511 "Plus" pipeline
+        self._is_plus = False   # True for a Qwen 2509/2511 "Plus" pipeline
+        self._is_qwen = _is_qwen_edit(model_id)
+        # Names accepted by the current pipeline's __call__ (None = accept all).
+        self._call_params: Optional[set] = None
+        # GGUF settings (overridable per-reload from the client).
+        self._gguf_repo = DEFAULT_GGUF_REPO
+        self._gguf_quant = DEFAULT_GGUF_QUANT
+        self._gguf_file = DEFAULT_GGUF_FILE
+        self._gguf_base = os.environ.get("QIE_GGUF_BASE", "")
         # Only one inference at a time — the model is a single shared GPU resource.
         self._infer_lock = threading.Lock()
         self._load_lock = threading.Lock()
@@ -273,112 +305,172 @@ class ModelManager:
     # Loading
     # ------------------------------------------------------------------ #
     def load(self) -> None:
-        """Load the pipeline. Safe to call once; subsequent calls are no-ops."""
+        """Load the currently-configured model. No-op if already ready."""
         with self._load_lock:
             if self.state.status == "ready":
                 return
-            self.state.status = "loading"
-            self.state.error = None
-            self.state.started_at = time.time()
-            self.state.message = f"Loading {self.state.model_id} ({self.state.precision})..."
-            print(f"📥 {self.state.message}")
-
-            try:
-                device = _select_device()
-                self.state.device = device
-
-                if self.state.precision == "gguf":
-                    # GGUF: load a K-quant transformer from a single .gguf file
-                    # (higher quality-per-bit than bnb 4-bit) and pull the rest
-                    # of the pipeline from the HF repo. Best quality/speed on a
-                    # 24 GB GPU — near full-precision, but fully resident (fast).
-                    pipeline = _build_gguf_pipeline(self.state.model_id)
-                    self._is_plus = _uses_plus_pipeline(
-                        os.environ.get("QIE_GGUF_BASE", self.state.model_id)
-                    )
-                else:
-                    load_kwargs = {
-                        "torch_dtype": torch.bfloat16,   # never load fp32 then convert
-                        "low_cpu_mem_usage": True,       # stream shards, no fp32 spike
-                    }
-
-                    quant_config = _build_quant_config(self.state.precision)
-                    if quant_config is not None:
-                        load_kwargs["quantization_config"] = quant_config
-
-                    # Pick the right pipeline class for the model revision.
-                    self._is_plus = _uses_plus_pipeline(self.state.model_id)
-                    if self._is_plus:
-                        if QwenImageEditPlusPipeline is None:
-                            raise RuntimeError(
-                                f"{self.state.model_id} needs QwenImageEditPlusPipeline, "
-                                "which this diffusers version lacks. Upgrade with: "
-                                "pip install -U diffusers"
-                            )
-                        pipeline_cls = QwenImageEditPlusPipeline
-                    else:
-                        pipeline_cls = QwenImageEditPipeline
-
-                    pipeline = pipeline_cls.from_pretrained(
-                        self.state.model_id, **load_kwargs
-                    )
-
-                if device == "cuda":
-                    if self.state.precision in ("bf16", "max"):
-                        # Full-precision weights (~57 GB) are far larger than a
-                        # 24 GB GPU, so stream them layer-by-layer from system
-                        # RAM. This runs the UNQUANTIZED model at maximum quality
-                        # on a small GPU — the trade-off is speed (weights cross
-                        # the PCIe bus every step). Needs enough system RAM to
-                        # hold the full model (~57 GB → 64 GB box is the minimum).
-                        pipeline.enable_sequential_cpu_offload()
-                    else:
-                        # Quantized (4bit/8bit): components fit, so stream whole
-                        # models to the GPU only while in use → low peak VRAM.
-                        pipeline.enable_model_cpu_offload()
-                elif device == "mps":
-                    pipeline.to("mps")
-                else:
-                    print("⚠️  No GPU detected — running on CPU will be very slow.")
-                    pipeline.to("cpu")
-
-                # Optional VAE memory savers (harmless, help on tight VRAM).
-                try:
-                    pipeline.vae.enable_slicing()
-                    pipeline.vae.enable_tiling()
-                except Exception:
-                    pass
-
-                pipeline.set_progress_bar_config(disable=None)
-
-                self._pipeline = pipeline
-                self.state.status = "ready"
-                self.state.ready_at = time.time()
-                self.state.message = (
-                    f"Ready on {device} ({self.state.precision}), "
-                    f"loaded in {self.state.as_dict()['load_seconds']}s."
-                )
-                print(f"✅ {self.state.message}")
-
-            except Exception as exc:  # noqa: BLE001
-                import traceback
-
-                self.state.status = "error"
-                self.state.error = str(exc)
-                self.state.message = f"Failed to load model: {exc}"
-                print(f"❌ {self.state.message}")
-                print(traceback.format_exc())
-                raise
+            self._do_load()
 
     def load_in_background(self) -> None:
         threading.Thread(target=self._safe_background_load, daemon=True).start()
+
+    def reload(
+        self,
+        model_id: str,
+        precision: str,
+        *,
+        gguf_repo: Optional[str] = None,
+        gguf_file: Optional[str] = None,
+        gguf_quant: Optional[str] = None,
+        gguf_base: Optional[str] = None,
+    ) -> None:
+        """Switch to a different model/precision. Runs in the background;
+        poll the state (via /health) until status is 'ready' or 'error'."""
+
+        def worker() -> None:
+            with self._load_lock:
+                self._teardown()
+                self._gguf_repo = (gguf_repo or DEFAULT_GGUF_REPO).strip()
+                self._gguf_quant = (gguf_quant or DEFAULT_GGUF_QUANT).strip()
+                self._gguf_file = (gguf_file or "").strip()
+                self._gguf_base = (gguf_base or "").strip()
+                self.state = LoadState(
+                    model_id=model_id.strip(),
+                    precision=(precision or DEFAULT_PRECISION).strip().lower(),
+                )
+                try:
+                    self._do_load()
+                except Exception:
+                    pass  # error already recorded in state
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _safe_background_load(self) -> None:
         try:
             self.load()
         except Exception:
-            # State already records the error; don't crash the server thread.
-            pass
+            pass  # state already records the error
+
+    def _teardown(self) -> None:
+        """Free the current pipeline + VRAM before loading another model."""
+        with self._infer_lock:
+            self._pipeline = None
+            self._call_params = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _do_load(self) -> None:
+        """Actually build the pipeline. Assumes the load lock is held."""
+        self.state.status = "loading"
+        self.state.error = None
+        self.state.started_at = time.time()
+        self.state.message = f"Loading {self.state.model_id} ({self.state.precision})..."
+        print(f"📥 {self.state.message}")
+
+        try:
+            device = _select_device()
+            self.state.device = device
+            self._is_qwen = _is_qwen_edit(self.state.model_id) or (
+                self.state.precision == "gguf"
+            )
+
+            pipeline = self._construct_pipeline()
+            self._apply_offload(pipeline, device)
+
+            # Optional VAE memory savers (harmless, help on tight VRAM).
+            for meth in ("enable_slicing", "enable_tiling"):
+                try:
+                    getattr(pipeline.vae, meth)()
+                except Exception:
+                    pass
+
+            try:
+                pipeline.set_progress_bar_config(disable=None)
+            except Exception:
+                pass
+
+            self._pipeline = pipeline
+            self._call_params = _accepted_call_params(pipeline)
+            self.state.status = "ready"
+            self.state.ready_at = time.time()
+            self.state.message = (
+                f"Ready on {device} ({self.state.precision}), "
+                f"loaded in {self.state.as_dict()['load_seconds']}s."
+            )
+            print(f"✅ {self.state.message}")
+
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+
+            self.state.status = "error"
+            self.state.error = str(exc)
+            self.state.message = f"Failed to load model: {exc}"
+            print(f"❌ {self.state.message}")
+            print(traceback.format_exc())
+            raise
+
+    def _construct_pipeline(self):
+        """Build the right pipeline for the configured model + precision."""
+        model_id = self.state.model_id
+        precision = self.state.precision
+
+        if precision == "gguf":
+            pipeline, base = _build_gguf_pipeline(
+                model_id, self._gguf_repo, self._gguf_file,
+                self._gguf_quant, self._gguf_base,
+            )
+            self._is_plus = _uses_plus_pipeline(base)
+            return pipeline
+
+        load_kwargs = {
+            "torch_dtype": torch.bfloat16,   # never load fp32 then convert
+            "low_cpu_mem_usage": True,       # stream shards, no fp32 spike
+        }
+
+        if _is_qwen_edit(model_id):
+            # Qwen edit models: transformer + text_encoder are the memory hogs.
+            quant_config = _build_quant_config(precision, ["transformer", "text_encoder"])
+            if quant_config is not None:
+                load_kwargs["quantization_config"] = quant_config
+            self._is_plus = _uses_plus_pipeline(model_id)
+            if self._is_plus:
+                if QwenImageEditPlusPipeline is None:
+                    raise RuntimeError(
+                        f"{model_id} needs QwenImageEditPlusPipeline, missing from "
+                        "this diffusers. Upgrade: pip install -U diffusers"
+                    )
+                pipeline_cls = QwenImageEditPlusPipeline
+            else:
+                pipeline_cls = QwenImageEditPipeline
+            return pipeline_cls.from_pretrained(model_id, **load_kwargs)
+
+        # Any other model: auto-detect the image-to-image pipeline class.
+        self._is_plus = False
+        if AutoPipelineForImage2Image is None:
+            raise RuntimeError(
+                "AutoPipelineForImage2Image is unavailable; upgrade diffusers."
+            )
+        # Quantize all quantizable submodules (component names vary across
+        # architectures — unet vs transformer — so don't restrict them).
+        quant_config = _build_quant_config(precision, None)
+        if quant_config is not None:
+            load_kwargs["quantization_config"] = quant_config
+        return AutoPipelineForImage2Image.from_pretrained(model_id, **load_kwargs)
+
+    def _apply_offload(self, pipeline, device: str) -> None:
+        if device == "cuda":
+            if self.state.precision in ("bf16", "max"):
+                # Full precision larger than VRAM → stream layer-by-layer.
+                pipeline.enable_sequential_cpu_offload()
+            else:
+                # Quantized/GGUF: stream whole components to GPU as used.
+                pipeline.enable_model_cpu_offload()
+        elif device == "mps":
+            pipeline.to("mps")
+        else:
+            print("⚠️  No GPU detected — running on CPU will be very slow.")
+            pipeline.to("cpu")
 
     @property
     def is_ready(self) -> bool:
@@ -398,7 +490,11 @@ class ModelManager:
         seed: int = 0,
         guidance_scale: float = 1.0,
     ) -> Image.Image:
-        """Run one image edit. Blocks if another edit is in progress."""
+        """Run one image edit. Blocks if another edit is in progress.
+
+        Optional parameters are filtered to what the loaded pipeline actually
+        accepts, so this works across Qwen, FLUX Kontext, SD img2img, etc.
+        """
         if not self.is_ready:
             raise RuntimeError(
                 f"Model is not ready (status={self.state.status}). "
@@ -408,28 +504,49 @@ class ModelManager:
         image = image.convert("RGB")
         gen_device = "cuda" if self.state.device == "cuda" else "cpu"
 
+        # Always-present inputs.
         inputs = {
-            # The Plus (2509/2511) pipeline expects a list of images; the classic
-            # pipeline expects a single image.
+            # The Plus (2509/2511) pipeline expects a list of images.
             "image": [image] if self._is_plus else image,
             "prompt": prompt,
             "generator": torch.Generator(device=gen_device).manual_seed(int(seed)),
-            "true_cfg_scale": float(true_cfg_scale),
-            "negative_prompt": negative_prompt or " ",
-            "num_inference_steps": int(num_inference_steps),
-            # Distilled guidance embedding (separate from true_cfg_scale). Official
-            # Qwen examples use 1.0; higher values tend to over-saturate.
-            "guidance_scale": float(guidance_scale),
         }
+
+        # Optional inputs — included only if the pipeline's __call__ accepts them.
+        optional = {
+            "num_inference_steps": int(num_inference_steps),
+            "guidance_scale": float(guidance_scale),
+            "true_cfg_scale": float(true_cfg_scale),
+        }
+        # Qwen wants a single space for "no negative prompt"; others take "".
+        if negative_prompt:
+            optional["negative_prompt"] = negative_prompt
+        elif self._is_qwen:
+            optional["negative_prompt"] = " "
+
+        for key, value in optional.items():
+            if self._call_params is None or key in self._call_params:
+                inputs[key] = value
 
         with self._infer_lock:
             with torch.inference_mode():
                 output = self._pipeline(**inputs)
             result = output.images[0]
 
-        # Reclaim any transient VRAM held between requests.
         if self.state.device == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
         return result
+
+
+def _accepted_call_params(pipeline) -> Optional[set]:
+    """Return the set of keyword names the pipeline's __call__ accepts, or None
+    if it takes **kwargs (accept anything)."""
+    try:
+        sig = inspect.signature(pipeline.__call__)
+    except (TypeError, ValueError):
+        return None
+    if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+        return None
+    return set(sig.parameters)

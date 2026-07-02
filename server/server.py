@@ -10,6 +10,8 @@ Endpoints
 ---------
 GET  /health            Liveness + model status (JSON).
 GET  /status            Alias of /health.
+GET  /models            Suggested models the client can load.
+POST /load              JSON: switch to a different model/precision (async).
 POST /edit              multipart/form-data: image file + edit parameters,
                         returns the edited image as PNG bytes.
 
@@ -19,10 +21,14 @@ Run it
     # or
     uvicorn server:app --host 0.0.0.0 --port 8000
 
+The loaded model can also be switched at runtime by the client via POST /load,
+so these just set the initial model.
+
 Environment
 -----------
-    QIE_MODEL_ID   HF repo id (default: Qwen/Qwen-Image-Edit)
-    QIE_PRECISION  4bit (default) | 8bit | bf16
+    QIE_MODEL_ID   HF repo id (default: Qwen/Qwen-Image-Edit-2511)
+    QIE_PRECISION  gguf | 4bit | 8bit | max/bf16  (default: 4bit)
+    QIE_GGUF_REPO/FILE/QUANT/BASE   GGUF source overrides
     QIE_HOST       bind host (default: 0.0.0.0)
     QIE_PORT       bind port (default: 8000)
     QIE_API_KEY    if set, clients must send it as the X-API-Key header
@@ -36,9 +42,26 @@ import os
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from PIL import Image
 
 from model_manager import DEFAULT_MODEL_ID, DEFAULT_PRECISION, ModelManager
+
+# Suggested models for the client's dropdown. The first is the default.
+SUGGESTED_MODELS = [
+    {"model_id": "Qwen/Qwen-Image-Edit-2511", "precision": "gguf",
+     "label": "Qwen Image Edit 2511 (GGUF Q6_K) — recommended"},
+    {"model_id": "Qwen/Qwen-Image-Edit-2511", "precision": "max",
+     "label": "Qwen Image Edit 2511 (full bf16, slow)"},
+    {"model_id": "Qwen/Qwen-Image-Edit-2509", "precision": "4bit",
+     "label": "Qwen Image Edit 2509 (4-bit)"},
+    {"model_id": "Qwen/Qwen-Image-Edit", "precision": "4bit",
+     "label": "Qwen Image Edit original (4-bit)"},
+    {"model_id": "black-forest-labs/FLUX.1-Kontext-dev", "precision": "4bit",
+     "label": "FLUX.1 Kontext dev (4-bit) — non-Qwen edit model"},
+    {"model_id": "timbrooks/instruct-pix2pix", "precision": "bf16",
+     "label": "InstructPix2Pix (bf16) — non-Qwen edit model"},
+]
 
 API_KEY = os.environ.get("QIE_API_KEY", "").strip()
 
@@ -74,6 +97,39 @@ def _check_api_key(provided: str | None) -> None:
 @app.get("/health")
 @app.get("/status")
 def health() -> JSONResponse:
+    return JSONResponse(manager.state.as_dict())
+
+
+@app.get("/models")
+def models() -> JSONResponse:
+    return JSONResponse({"models": SUGGESTED_MODELS})
+
+
+class LoadRequest(BaseModel):
+    model_id: str
+    precision: str = "gguf"
+    # GGUF-only overrides (ignored for other precisions):
+    gguf_repo: str | None = None
+    gguf_file: str | None = None
+    gguf_quant: str | None = None
+    gguf_base: str | None = None
+
+
+@app.post("/load")
+def load_model(req: LoadRequest, x_api_key: str | None = Header(default=None)) -> JSONResponse:
+    """Switch the loaded model. Returns immediately with status='loading';
+    the client should poll /health until status is 'ready' or 'error'."""
+    _check_api_key(x_api_key)
+    if not req.model_id.strip():
+        raise HTTPException(status_code=400, detail="model_id is required.")
+    manager.reload(
+        req.model_id,
+        req.precision,
+        gguf_repo=req.gguf_repo,
+        gguf_file=req.gguf_file,
+        gguf_quant=req.gguf_quant,
+        gguf_base=req.gguf_base,
+    )
     return JSONResponse(manager.state.as_dict())
 
 

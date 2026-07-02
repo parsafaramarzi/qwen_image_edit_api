@@ -79,6 +79,28 @@ class ImageEditorClient:
         self.connect_btn = ttk.Button(self.server_frame, text="🔌 Check", command=self.check_server)
         self.server_status = ttk.Label(self.server_frame, text="⚪ Not checked", font=("Arial", 9))
 
+        # Model selection bar
+        self.model_frame = ttk.LabelFrame(self.main_frame, text="🧠 Model", padding="5")
+        ttk.Label(self.model_frame, text="Model:").grid(row=0, column=0, sticky="w")
+        self.model_var = tk.StringVar(value="")
+        # Editable combobox: pick a preset or type any HF repo id.
+        self.model_combo = ttk.Combobox(self.model_frame, textvariable=self.model_var, width=42)
+        ttk.Label(self.model_frame, text="Precision:").grid(row=0, column=2, sticky="w", padx=(10, 0))
+        self.precision_var = tk.StringVar(value="gguf")
+        self.precision_combo = ttk.Combobox(
+            self.model_frame, textvariable=self.precision_var, width=8, state="readonly",
+            values=["gguf", "4bit", "8bit", "bf16", "max"],
+        )
+        ttk.Label(self.model_frame, text="GGUF quant:").grid(row=0, column=4, sticky="w", padx=(10, 0))
+        self.gguf_quant_var = tk.StringVar(value="Q6_K")
+        self.gguf_quant_entry = ttk.Entry(self.model_frame, textvariable=self.gguf_quant_var, width=8)
+        self.load_model_btn = ttk.Button(self.model_frame, text="⬇️ Load Model", command=self.load_model)
+        self.model_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
+        # Maps the combobox label → (model_id, precision) from /models.
+        self._model_presets: dict = {}
+        # When a preset is chosen, sync the precision box to its suggestion.
+        self.model_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
+
         # Input
         self.input_frame = ttk.LabelFrame(self.main_frame, text="📥 Input Image", padding="5")
         self.input_canvas = tk.Canvas(self.input_frame, width=300, height=300, bg="#f0f0f0")
@@ -129,6 +151,13 @@ class ImageEditorClient:
         self.connect_btn.grid(row=0, column=4, padx=5)
         self.server_status.grid(row=0, column=5, padx=10)
 
+        self.model_frame.pack(fill=tk.X, pady=(0, 10))
+        self.model_combo.grid(row=0, column=1, padx=5)
+        self.precision_combo.grid(row=0, column=3, padx=5)
+        self.gguf_quant_entry.grid(row=0, column=5, padx=5)
+        self.load_model_btn.grid(row=0, column=6, padx=5)
+        self.model_status.grid(row=0, column=7, padx=10)
+
         content_frame = ttk.Frame(self.main_frame)
         content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
@@ -173,8 +202,9 @@ class ImageEditorClient:
                 resp.raise_for_status()
                 data = resp.json()
                 status = data.get("status")
+                model = data.get("model_id", "?")
                 if status == "ready":
-                    text = f"🟢 Ready ({data.get('device')}, {data.get('precision')})"
+                    text = f"🟢 Ready ({data.get('device')}, {data.get('precision')}) · {model}"
                 elif status == "loading":
                     text = f"🟡 Loading… ({data.get('message', '')})"
                 elif status == "error":
@@ -191,6 +221,111 @@ class ImageEditorClient:
                 )
 
         threading.Thread(target=worker, daemon=True).start()
+        self._fetch_models()
+
+    # ------------------------------------------------------------------ #
+    # Model selection
+    # ------------------------------------------------------------------ #
+    def _fetch_models(self) -> None:
+        """Populate the model dropdown from the server's /models list."""
+        def worker():
+            try:
+                resp = requests.get(
+                    f"{self.base_url()}/models", headers=self.auth_headers(), timeout=10
+                )
+                resp.raise_for_status()
+                items = resp.json().get("models", [])
+            except Exception:
+                return  # leave the combobox as free-text only
+
+            presets = {}
+            labels = []
+            for it in items:
+                label = it.get("label") or it.get("model_id", "")
+                presets[label] = (it.get("model_id", ""), it.get("precision", "gguf"))
+                labels.append(label)
+
+            def apply():
+                self._model_presets = presets
+                self.model_combo["values"] = labels
+                # Prefill with the first suggestion if nothing chosen yet.
+                if labels and not self.model_var.get():
+                    self.model_combo.set(labels[0])
+                    self._on_preset_selected()
+            self.root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_preset_selected(self, _event=None) -> None:
+        """When a preset label is picked, sync precision to its suggestion."""
+        preset = self._model_presets.get(self.model_var.get())
+        if preset:
+            self.precision_var.set(preset[1])
+
+    def _selected_model_id(self) -> str:
+        """Resolve the field to a model id (a preset label maps to its repo id)."""
+        value = self.model_var.get().strip()
+        preset = self._model_presets.get(value)
+        return preset[0] if preset else value
+
+    def load_model(self) -> None:
+        """POST /load then poll /health until the new model is ready."""
+        model_id = self._selected_model_id()
+        if not model_id:
+            messagebox.showwarning("No Model", "Pick a preset or type a model id first.")
+            return
+
+        payload = {
+            "model_id": model_id,
+            "precision": self.precision_var.get().strip(),
+            "gguf_quant": self.gguf_quant_var.get().strip() or None,
+        }
+        self.load_model_btn.config(state="disabled")
+        self.model_status.config(text="⏳ Requesting load…")
+
+        def worker():
+            try:
+                resp = requests.post(
+                    f"{self.base_url()}/load", json=payload,
+                    headers=self.auth_headers(), timeout=30,
+                )
+                resp.raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                self.root.after(0, lambda: self._load_done(f"🔴 Load failed: {msg}"))
+                return
+
+            # Poll /health until ready/error (model download can take a while).
+            import time as _t
+            deadline = _t.time() + 3600
+            while _t.time() < deadline:
+                try:
+                    h = requests.get(
+                        f"{self.base_url()}/health", headers=self.auth_headers(), timeout=10
+                    ).json()
+                except Exception:
+                    _t.sleep(3)
+                    continue
+                st = h.get("status")
+                if st == "ready":
+                    self.root.after(0, lambda: self._load_done(
+                        f"🟢 Loaded: {h.get('model_id')} ({h.get('precision')})"))
+                    self.root.after(0, self.check_server)
+                    return
+                if st == "error":
+                    err = h.get("error", "unknown")
+                    self.root.after(0, lambda: self._load_done(f"🔴 Error: {err}"))
+                    return
+                self.root.after(0, lambda m=h.get("message", ""): self.model_status.config(
+                    text=f"🟡 Loading… {m}"))
+                _t.sleep(4)
+            self.root.after(0, lambda: self._load_done("🔴 Timed out waiting for load."))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _load_done(self, text: str) -> None:
+        self.model_status.config(text=text)
+        self.load_model_btn.config(state="normal")
 
     # ------------------------------------------------------------------ #
     # Image loading / display
