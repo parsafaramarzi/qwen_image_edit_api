@@ -314,8 +314,13 @@ class ImageEditorClient:
 
         rows: list = []  # parallel to listbox: list of (repo_id, size_str)
 
+        def set_status(text: str) -> None:
+            # The window may have been closed before a background call returns.
+            if win.winfo_exists():
+                status.config(text=text)
+
         def refresh():
-            status.config(text="Loading…")
+            set_status("Loading…")
             def worker():
                 try:
                     resp = requests.get(
@@ -325,10 +330,12 @@ class ImageEditorClient:
                     models = resp.json().get("models", [])
                 except Exception as exc:  # noqa: BLE001
                     msg = str(exc)
-                    self.root.after(0, lambda: status.config(text=f"🔴 {msg}"))
+                    self.root.after(0, lambda: set_status(f"🔴 {msg}"))
                     return
 
                 def apply():
+                    if not win.winfo_exists():
+                        return
                     rows.clear()
                     listbox.delete(0, tk.END)
                     total = 0
@@ -337,7 +344,7 @@ class ImageEditorClient:
                         listbox.insert(tk.END, f"{m['repo_id']}   —   {m['size_str']}")
                         total += m.get("size", 0)
                     gb = total / (1024 ** 3)
-                    status.config(text=f"{len(models)} model(s), {gb:.1f} GB total")
+                    set_status(f"{len(models)} model(s), {gb:.1f} GB total")
                 self.root.after(0, apply)
 
             threading.Thread(target=worker, daemon=True).start()
@@ -349,7 +356,7 @@ class ImageEditorClient:
             repo_id = rows[sel[0]][0]
             if not messagebox.askyesno("Delete", f"Delete '{repo_id}' from the server cache?"):
                 return
-            status.config(text=f"Deleting {repo_id}…")
+            set_status(f"Deleting {repo_id}…")
             def worker():
                 try:
                     resp = requests.post(
@@ -360,10 +367,10 @@ class ImageEditorClient:
                     freed = resp.json().get("freed_str", "")
                 except Exception as exc:  # noqa: BLE001
                     msg = str(exc)
-                    self.root.after(0, lambda: status.config(text=f"🔴 {msg}"))
+                    self.root.after(0, lambda: set_status(f"🔴 {msg}"))
                     return
-                self.root.after(0, lambda: status.config(text=f"✅ Freed {freed}"))
-                self.root.after(300, refresh)
+                self.root.after(0, lambda: set_status(f"✅ Freed {freed}"))
+                self.root.after(300, lambda: refresh() if win.winfo_exists() else None)
                 self.root.after(300, self._fetch_models)  # refresh dropdown marks
             threading.Thread(target=worker, daemon=True).start()
 
