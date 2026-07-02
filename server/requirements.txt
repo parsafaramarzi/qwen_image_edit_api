@@ -1,0 +1,26 @@
+# ─────────────────────────────────────────────────────────────
+# Qwen Image Edit — SERVER (GPU box) dependencies
+# Install on the machine with the RTX 3090.
+# ─────────────────────────────────────────────────────────────
+
+# Core model stack
+torch>=2.1.0
+torchvision>=0.16.0
+diffusers>=0.32.0        # needs PipelineQuantizationConfig support
+transformers>=4.45.0
+accelerate>=0.30.0
+safetensors>=0.4.0
+
+# 4-bit / 8-bit quantization (required for QIE_PRECISION=4bit|8bit).
+# On Windows use a recent wheel with native support:
+#   pip install bitsandbytes>=0.43.0
+bitsandbytes>=0.43.0
+
+# API server
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9  # required by FastAPI for multipart/form-data uploads
+
+# Image processing
+Pillow>=9.0.0
+numpy>=1.21.0

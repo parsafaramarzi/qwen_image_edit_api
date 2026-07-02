@@ -1,0 +1,10 @@
+# ─────────────────────────────────────────────────────────────
+# Qwen Image Edit — CLIENT (your personal PC) dependencies
+# No torch / diffusers / GPU needed here — the client only sends
+# HTTP requests to the server and displays images.
+# ─────────────────────────────────────────────────────────────
+requests>=2.31.0
+Pillow>=9.0.0
+
+# tkinter ships with the standard CPython installer on Windows/macOS.
+# On Linux: sudo apt-get install python3-tk

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Model cache / downloaded weights
+.cache/
+models/
+huggingface_cache/
+*.safetensors
+*.bin
+*.ckpt
+
+# Input/Output images
+input.png
+output*.png
+output*.jpg
+output*.jpeg
+*_edited.*
+edited_*.*
+outputs/
+results/
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+
+# Claude session data
+.claude/
