@@ -24,9 +24,16 @@ This module fixes both problems:
 
 Precision is configurable through the ``QIE_PRECISION`` environment variable:
 
-  * ``4bit``  (default) — nf4 quantized, fits 32 GB RAM + 24 GB VRAM.
-  * ``8bit``  — int8 quantized, needs more VRAM/RAM but higher fidelity.
-  * ``bf16``  — full bfloat16, only for large-VRAM/large-RAM machines.
+  * ``4bit``  (default) — nf4 quantized, smallest/fastest, fits 32 GB RAM +
+    24 GB VRAM comfortably. Some quality loss (the transformer is quant-
+    sensitive), so edits can look softer/noisier.
+  * ``8bit``  — int8 quantized. Higher fidelity, but the transformer alone is
+    ~20 GB so it does NOT fit a 24 GB card alongside the text encoder.
+  * ``max`` / ``bf16`` — FULL precision, no quantization. On a small GPU this
+    uses sequential CPU offload: the complete bf16 weights live in system RAM
+    (~57 GB, needs a 64 GB box) and stream through the GPU layer-by-layer.
+    Highest possible quality; slower per image (a few minutes) because weights
+    cross the PCIe bus each step. This is the max quality a 24 GB GPU can run.
 """
 
 from __future__ import annotations
@@ -180,9 +187,18 @@ class ModelManager:
                 )
 
                 if device == "cuda":
-                    # Stream components to GPU only while in use → low peak VRAM.
-                    # Works with quantized weights and keeps a 3090 within budget.
-                    pipeline.enable_model_cpu_offload()
+                    if self.state.precision in ("bf16", "max"):
+                        # Full-precision weights (~57 GB) are far larger than a
+                        # 24 GB GPU, so stream them layer-by-layer from system
+                        # RAM. This runs the UNQUANTIZED model at maximum quality
+                        # on a small GPU — the trade-off is speed (weights cross
+                        # the PCIe bus every step). Needs enough system RAM to
+                        # hold the full model (~57 GB → 64 GB box is the minimum).
+                        pipeline.enable_sequential_cpu_offload()
+                    else:
+                        # Quantized (4bit/8bit): components fit, so stream whole
+                        # models to the GPU only while in use → low peak VRAM.
+                        pipeline.enable_model_cpu_offload()
                 elif device == "mps":
                     pipeline.to("mps")
                 else:
