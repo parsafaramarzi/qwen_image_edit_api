@@ -81,10 +81,11 @@ def health() -> JSONResponse:
 async def edit(
     image: UploadFile = File(..., description="Input image to edit."),
     prompt: str = Form(..., description="Edit instruction."),
-    num_inference_steps: int = Form(30),
+    num_inference_steps: int = Form(40),
     true_cfg_scale: float = Form(4.0),
     negative_prompt: str = Form(""),
     seed: int = Form(0),
+    guidance_scale: float = Form(1.0),
     x_api_key: str | None = Header(default=None),
 ):
     _check_api_key(x_api_key)
@@ -113,6 +114,7 @@ async def edit(
             true_cfg_scale=true_cfg_scale,
             negative_prompt=negative_prompt,
             seed=seed,
+            guidance_scale=guidance_scale,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Inference failed: {exc}")

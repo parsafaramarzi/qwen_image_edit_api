@@ -55,11 +55,26 @@ except ImportError as exc:  # pragma: no cover - dependency guard
         "❌ diffusers is not installed. Run: pip install -r requirements.txt"
     ) from exc
 
+# The 2509/2511 revisions use a DIFFERENT pipeline class (the "Plus" pipeline,
+# with multi-image + better realism/consistency). It only exists in newer
+# diffusers, so import it defensively.
+try:
+    from diffusers import QwenImageEditPlusPipeline
+except ImportError:  # pragma: no cover - older diffusers
+    QwenImageEditPlusPipeline = None
 
-# Default model. Override with QIE_MODEL_ID. The newer "Qwen/Qwen-Image-Edit-2509"
-# is a drop-in replacement if you want the latest revision.
-DEFAULT_MODEL_ID = os.environ.get("QIE_MODEL_ID", "Qwen/Qwen-Image-Edit")
+
+# Default model. Override with QIE_MODEL_ID. Qwen-Image-Edit-2511 is the latest
+# revision (improved realism, character consistency, less drift) and uses the
+# "Plus" pipeline, which is auto-detected below.
+DEFAULT_MODEL_ID = os.environ.get("QIE_MODEL_ID", "Qwen/Qwen-Image-Edit-2511")
 DEFAULT_PRECISION = os.environ.get("QIE_PRECISION", "4bit").lower()
+
+
+def _uses_plus_pipeline(model_id: str) -> bool:
+    """The 2509/2511 (and any '...-Plus') revisions need QwenImageEditPlusPipeline."""
+    mid = model_id.lower()
+    return any(tag in mid for tag in ("2509", "2511", "plus"))
 
 
 @dataclass
@@ -150,7 +165,8 @@ class ModelManager:
         precision: str = DEFAULT_PRECISION,
     ) -> None:
         self.state = LoadState(model_id=model_id, precision=precision)
-        self._pipeline: Optional[QwenImageEditPipeline] = None
+        self._pipeline = None
+        self._is_plus = False  # True when running a 2509/2511 "Plus" pipeline
         # Only one inference at a time — the model is a single shared GPU resource.
         self._infer_lock = threading.Lock()
         self._load_lock = threading.Lock()
@@ -182,7 +198,20 @@ class ModelManager:
                 if quant_config is not None:
                     load_kwargs["quantization_config"] = quant_config
 
-                pipeline = QwenImageEditPipeline.from_pretrained(
+                # Pick the right pipeline class for the model revision.
+                self._is_plus = _uses_plus_pipeline(self.state.model_id)
+                if self._is_plus:
+                    if QwenImageEditPlusPipeline is None:
+                        raise RuntimeError(
+                            f"{self.state.model_id} needs QwenImageEditPlusPipeline, "
+                            "which this diffusers version lacks. Upgrade with: "
+                            "pip install -U diffusers"
+                        )
+                    pipeline_cls = QwenImageEditPlusPipeline
+                else:
+                    pipeline_cls = QwenImageEditPipeline
+
+                pipeline = pipeline_cls.from_pretrained(
                     self.state.model_id, **load_kwargs
                 )
 
@@ -255,10 +284,11 @@ class ModelManager:
         image: Image.Image,
         prompt: str,
         *,
-        num_inference_steps: int = 30,
+        num_inference_steps: int = 40,
         true_cfg_scale: float = 4.0,
         negative_prompt: str = "",
         seed: int = 0,
+        guidance_scale: float = 1.0,
     ) -> Image.Image:
         """Run one image edit. Blocks if another edit is in progress."""
         if not self.is_ready:
@@ -271,12 +301,17 @@ class ModelManager:
         gen_device = "cuda" if self.state.device == "cuda" else "cpu"
 
         inputs = {
-            "image": image,
+            # The Plus (2509/2511) pipeline expects a list of images; the classic
+            # pipeline expects a single image.
+            "image": [image] if self._is_plus else image,
             "prompt": prompt,
             "generator": torch.Generator(device=gen_device).manual_seed(int(seed)),
             "true_cfg_scale": float(true_cfg_scale),
             "negative_prompt": negative_prompt or " ",
             "num_inference_steps": int(num_inference_steps),
+            # Distilled guidance embedding (separate from true_cfg_scale). Official
+            # Qwen examples use 1.0; higher values tend to over-saturate.
+            "guidance_scale": float(guidance_scale),
         }
 
         with self._infer_lock:

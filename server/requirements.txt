@@ -6,7 +6,9 @@
 # Core model stack
 torch>=2.1.0
 torchvision>=0.16.0
-diffusers>=0.32.0        # needs PipelineQuantizationConfig support
+# Qwen-Image-Edit-2511 (default) needs QwenImageEditPlusPipeline — only in
+# recent diffusers. If loading 2509/2511 errors, run: pip install -U diffusers
+diffusers>=0.35.0
 transformers>=4.45.0
 accelerate>=0.30.0
 safetensors>=0.4.0
