@@ -180,9 +180,9 @@ def _build_quant_config(precision: str, components: Optional[list] = None):
 # GGUF defaults. Q6_K is the sweet spot for a 24 GB GPU: ~17 GB, near-full
 # quality, fully resident (fast). Change the quant with QIE_GGUF_QUANT
 # (e.g. Q8_0, Q5_K_M, Q4_K_M), or pin an exact file with QIE_GGUF_FILE.
-DEFAULT_GGUF_REPO = os.environ.get(
-    "QIE_GGUF_REPO", "QuantStack/Qwen-Image-Edit-2511-GGUF"
-)
+# Empty by default → the repo is auto-detected from the model id (see
+# _resolve_gguf_repo). Set QIE_GGUF_REPO to pin a specific GGUF re-uploader.
+DEFAULT_GGUF_REPO = os.environ.get("QIE_GGUF_REPO", "").strip()
 DEFAULT_GGUF_QUANT = os.environ.get("QIE_GGUF_QUANT", "Q6_K")
 # If set, use this exact filename; otherwise auto-discover by quant tag.
 DEFAULT_GGUF_FILE = os.environ.get("QIE_GGUF_FILE", "").strip()
@@ -216,6 +216,35 @@ def _resolve_gguf_filename(repo: str, explicit: str, quant: str) -> str:
     return sorted(matches, key=len)[0]
 
 
+def _resolve_gguf_repo(model_id: str, explicit: str) -> str:
+    """Find a GGUF repo for the model. Uses ``explicit`` if given, else probes
+    common community re-uploaders and returns the first that exists."""
+    if explicit:
+        return explicit
+
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    name = model_id.split("/")[-1]
+    candidates = [
+        f"QuantStack/{name}-GGUF",
+        f"unsloth/{name}-GGUF",
+        f"city96/{name}-gguf",
+        f"QuantStack/{name}-gguf",
+    ]
+    for cand in candidates:
+        try:
+            if api.repo_exists(cand):
+                print(f"🔎 Found GGUF repo: {cand}")
+                return cand
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"No GGUF repo found for '{model_id}' (tried {', '.join(candidates)}). "
+        "Set gguf_repo explicitly, or use precision 4bit/8bit/bf16 instead."
+    )
+
+
 def _build_gguf_pipeline(model_id: str, repo: str, file: str, quant: str, base: str):
     """Load a GGUF-quantized transformer + the rest of the pipeline from HF.
 
@@ -228,6 +257,8 @@ def _build_gguf_pipeline(model_id: str, repo: str, file: str, quant: str, base: 
             "GGUF precision currently supports only Qwen-Image-Edit models. "
             "For other models pick precision 4bit/8bit/bf16."
         )
+
+    repo = _resolve_gguf_repo(model_id, repo)
 
     try:
         from diffusers import GGUFQuantizationConfig, QwenImageTransformer2DModel
@@ -297,9 +328,15 @@ class ModelManager:
         self._gguf_quant = DEFAULT_GGUF_QUANT
         self._gguf_file = DEFAULT_GGUF_FILE
         self._gguf_base = os.environ.get("QIE_GGUF_BASE", "")
+        # Live inference progress (polled by the client via /progress).
+        self._progress = {"active": False, "stage": "idle", "step": 0, "total": 0}
         # Only one inference at a time — the model is a single shared GPU resource.
         self._infer_lock = threading.Lock()
         self._load_lock = threading.Lock()
+
+    @property
+    def progress(self) -> dict:
+        return dict(self._progress)
 
     # ------------------------------------------------------------------ #
     # Loading
@@ -503,6 +540,7 @@ class ModelManager:
 
         image = image.convert("RGB")
         gen_device = "cuda" if self.state.device == "cuda" else "cpu"
+        steps = int(num_inference_steps)
 
         # Always-present inputs.
         inputs = {
@@ -514,7 +552,7 @@ class ModelManager:
 
         # Optional inputs — included only if the pipeline's __call__ accepts them.
         optional = {
-            "num_inference_steps": int(num_inference_steps),
+            "num_inference_steps": steps,
             "guidance_scale": float(guidance_scale),
             "true_cfg_scale": float(true_cfg_scale),
         }
@@ -528,10 +566,30 @@ class ModelManager:
             if self._call_params is None or key in self._call_params:
                 inputs[key] = value
 
+        # Per-step progress callback (if the pipeline supports the newer API).
+        def _on_step(pipe, step, timestep, cbkw):
+            self._progress.update(
+                {"active": True, "stage": "denoising", "step": step + 1, "total": steps}
+            )
+            return cbkw
+
+        if self._call_params is None or "callback_on_step_end" in self._call_params:
+            inputs["callback_on_step_end"] = _on_step
+
         with self._infer_lock:
-            with torch.inference_mode():
-                output = self._pipeline(**inputs)
-            result = output.images[0]
+            # "preparing" covers upload received + prompt/image encoding, before
+            # the first denoising step fires the callback.
+            self._progress.update(
+                {"active": True, "stage": "preparing", "step": 0, "total": steps}
+            )
+            try:
+                with torch.inference_mode():
+                    output = self._pipeline(**inputs)
+                result = output.images[0]
+            finally:
+                self._progress.update(
+                    {"active": False, "stage": "idle", "step": 0, "total": 0}
+                )
 
         if self.state.device == "cuda":
             torch.cuda.empty_cache()
@@ -550,3 +608,85 @@ def _accepted_call_params(pipeline) -> Optional[set]:
     if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
         return None
     return set(sig.parameters)
+
+
+# ---------------------------------------------------------------------------- #
+# Hugging Face cache management (downloaded models)
+# ---------------------------------------------------------------------------- #
+def _human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def list_cached_models() -> list:
+    """Return the models already downloaded to the HF cache (id + size)."""
+    try:
+        from huggingface_hub import scan_cache_dir
+
+        info = scan_cache_dir()
+    except Exception as exc:  # noqa: BLE001
+        return []
+    out = []
+    for repo in info.repos:
+        if getattr(repo, "repo_type", "model") != "model":
+            continue
+        out.append(
+            {
+                "repo_id": repo.repo_id,
+                "size": repo.size_on_disk,
+                "size_str": _human_size(repo.size_on_disk),
+            }
+        )
+    return sorted(out, key=lambda r: -r["size"])
+
+
+def cached_repo_ids() -> set:
+    return {m["repo_id"] for m in list_cached_models()}
+
+
+def delete_cached_model(repo_id: str) -> dict:
+    """Delete all cached revisions of a model repo. Returns freed-space info."""
+    from huggingface_hub import scan_cache_dir
+
+    info = scan_cache_dir()
+    revisions = [
+        rev.commit_hash
+        for repo in info.repos
+        if repo.repo_id == repo_id
+        for rev in repo.revisions
+    ]
+    if not revisions:
+        raise RuntimeError(f"'{repo_id}' is not in the cache.")
+    strategy = info.delete_revisions(*revisions)
+    freed = strategy.expected_freed_size
+    strategy.execute()
+    return {"repo_id": repo_id, "freed": freed, "freed_str": _human_size(freed)}
+
+
+def validate_model(model_id: str) -> dict:
+    """Check whether a model repo exists on HF and whether it's already cached."""
+    model_id = model_id.strip()
+    result = {"model_id": model_id, "exists": False, "cached": False, "message": ""}
+    if not model_id:
+        result["message"] = "Empty model id."
+        return result
+
+    result["cached"] = model_id in cached_repo_ids()
+    try:
+        from huggingface_hub import HfApi
+
+        exists = HfApi().repo_exists(model_id)
+        result["exists"] = bool(exists)
+        result["message"] = "Found on Hugging Face." if exists else "Not found on Hugging Face."
+    except Exception as exc:  # noqa: BLE001
+        # If we can't reach HF but it's cached, it's still usable offline.
+        result["message"] = (
+            "Already downloaded (offline)." if result["cached"]
+            else f"Could not verify: {exc}"
+        )
+        result["exists"] = result["cached"]
+    return result

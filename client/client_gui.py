@@ -48,6 +48,7 @@ class ImageEditorClient:
         self.output_image: Optional[Image.Image] = None
         self.input_image_path: str = ""
         self.is_processing: bool = False
+        self._poll_progress: bool = False
 
         self.create_widgets()
         self.setup_layout()
@@ -84,20 +85,23 @@ class ImageEditorClient:
         ttk.Label(self.model_frame, text="Model:").grid(row=0, column=0, sticky="w")
         self.model_var = tk.StringVar(value="")
         # Editable combobox: pick a preset or type any HF repo id.
-        self.model_combo = ttk.Combobox(self.model_frame, textvariable=self.model_var, width=42)
-        ttk.Label(self.model_frame, text="Precision:").grid(row=0, column=2, sticky="w", padx=(10, 0))
+        self.model_combo = ttk.Combobox(self.model_frame, textvariable=self.model_var, width=40)
+        self.verify_btn = ttk.Button(self.model_frame, text="🔎 Verify", command=self.verify_model)
+        ttk.Label(self.model_frame, text="Precision:").grid(row=0, column=3, sticky="w", padx=(10, 0))
         self.precision_var = tk.StringVar(value="gguf")
         self.precision_combo = ttk.Combobox(
-            self.model_frame, textvariable=self.precision_var, width=8, state="readonly",
+            self.model_frame, textvariable=self.precision_var, width=7, state="readonly",
             values=["gguf", "4bit", "8bit", "bf16", "max"],
         )
-        ttk.Label(self.model_frame, text="GGUF quant:").grid(row=0, column=4, sticky="w", padx=(10, 0))
+        ttk.Label(self.model_frame, text="GGUF quant:").grid(row=0, column=5, sticky="w", padx=(10, 0))
         self.gguf_quant_var = tk.StringVar(value="Q6_K")
         self.gguf_quant_entry = ttk.Entry(self.model_frame, textvariable=self.gguf_quant_var, width=8)
-        self.load_model_btn = ttk.Button(self.model_frame, text="⬇️ Load Model", command=self.load_model)
+        self.load_model_btn = ttk.Button(self.model_frame, text="⬇️ Load", command=self.load_model)
+        self.downloads_btn = ttk.Button(self.model_frame, text="🗂 Downloads", command=self.open_downloads)
         self.model_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
         # Maps the combobox label → (model_id, precision) from /models.
         self._model_presets: dict = {}
+        self._cached_ids: set = set()
         # When a preset is chosen, sync the precision box to its suggestion.
         self.model_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
@@ -153,10 +157,12 @@ class ImageEditorClient:
 
         self.model_frame.pack(fill=tk.X, pady=(0, 10))
         self.model_combo.grid(row=0, column=1, padx=5)
-        self.precision_combo.grid(row=0, column=3, padx=5)
-        self.gguf_quant_entry.grid(row=0, column=5, padx=5)
-        self.load_model_btn.grid(row=0, column=6, padx=5)
-        self.model_status.grid(row=0, column=7, padx=10)
+        self.verify_btn.grid(row=0, column=2, padx=2)
+        self.precision_combo.grid(row=0, column=4, padx=5)
+        self.gguf_quant_entry.grid(row=0, column=6, padx=5)
+        self.load_model_btn.grid(row=0, column=7, padx=5)
+        self.downloads_btn.grid(row=0, column=8, padx=2)
+        self.model_status.grid(row=0, column=9, padx=10, sticky="w")
 
         content_frame = ttk.Frame(self.main_frame)
         content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -227,7 +233,7 @@ class ImageEditorClient:
     # Model selection
     # ------------------------------------------------------------------ #
     def _fetch_models(self) -> None:
-        """Populate the model dropdown from the server's /models list."""
+        """Populate the model dropdown from /models, marking downloaded ones."""
         def worker():
             try:
                 resp = requests.get(
@@ -240,21 +246,132 @@ class ImageEditorClient:
 
             presets = {}
             labels = []
+            cached_ids = set()
             for it in items:
-                label = it.get("label") or it.get("model_id", "")
+                base = it.get("label") or it.get("model_id", "")
+                is_cached = it.get("cached", False)
+                if is_cached:
+                    cached_ids.add(it.get("model_id", ""))
+                # ✅ = already downloaded, ⬇ = will download on load.
+                mark = "✅ " if is_cached else "⬇ "
+                label = mark + base
                 presets[label] = (it.get("model_id", ""), it.get("precision", "gguf"))
                 labels.append(label)
 
             def apply():
                 self._model_presets = presets
+                self._cached_ids = cached_ids
                 self.model_combo["values"] = labels
-                # Prefill with the first suggestion if nothing chosen yet.
                 if labels and not self.model_var.get():
                     self.model_combo.set(labels[0])
                     self._on_preset_selected()
             self.root.after(0, apply)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def verify_model(self) -> None:
+        """Ask the server whether the typed/selected model repo exists on HF."""
+        model_id = self._selected_model_id()
+        if not model_id:
+            messagebox.showwarning("No Model", "Type a model id or pick a preset first.")
+            return
+        self.model_status.config(text="🔎 Verifying…")
+
+        def worker():
+            try:
+                resp = requests.post(
+                    f"{self.base_url()}/validate", json={"model_id": model_id},
+                    headers=self.auth_headers(), timeout=20,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                self.root.after(0, lambda: self.model_status.config(text=f"🔴 {msg}"))
+                return
+
+            if data.get("exists"):
+                dl = "already downloaded" if data.get("cached") else "needs download"
+                text = f"🟢 Found ({dl})"
+            else:
+                text = f"🔴 {data.get('message', 'Not found')}"
+            self.root.after(0, lambda: self.model_status.config(text=text))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_downloads(self) -> None:
+        """Popup listing downloaded models with sizes and a delete option."""
+        win = tk.Toplevel(self.root)
+        win.title("🗂 Downloaded Models")
+        win.geometry("560x360")
+        win.transient(self.root)
+
+        ttk.Label(win, text="Models cached on the server", font=("Arial", 11, "bold")).pack(pady=8)
+        listbox = tk.Listbox(win, width=80, height=12)
+        listbox.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
+        status = ttk.Label(win, text="Loading…", font=("Arial", 9))
+        status.pack(pady=2)
+
+        rows: list = []  # parallel to listbox: list of (repo_id, size_str)
+
+        def refresh():
+            status.config(text="Loading…")
+            def worker():
+                try:
+                    resp = requests.get(
+                        f"{self.base_url()}/cache", headers=self.auth_headers(), timeout=15
+                    )
+                    resp.raise_for_status()
+                    models = resp.json().get("models", [])
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    self.root.after(0, lambda: status.config(text=f"🔴 {msg}"))
+                    return
+
+                def apply():
+                    rows.clear()
+                    listbox.delete(0, tk.END)
+                    total = 0
+                    for m in models:
+                        rows.append((m["repo_id"], m["size_str"]))
+                        listbox.insert(tk.END, f"{m['repo_id']}   —   {m['size_str']}")
+                        total += m.get("size", 0)
+                    gb = total / (1024 ** 3)
+                    status.config(text=f"{len(models)} model(s), {gb:.1f} GB total")
+                self.root.after(0, apply)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def delete_selected():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            repo_id = rows[sel[0]][0]
+            if not messagebox.askyesno("Delete", f"Delete '{repo_id}' from the server cache?"):
+                return
+            status.config(text=f"Deleting {repo_id}…")
+            def worker():
+                try:
+                    resp = requests.post(
+                        f"{self.base_url()}/cache/delete", json={"repo_id": repo_id},
+                        headers=self.auth_headers(), timeout=60,
+                    )
+                    resp.raise_for_status()
+                    freed = resp.json().get("freed_str", "")
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    self.root.after(0, lambda: status.config(text=f"🔴 {msg}"))
+                    return
+                self.root.after(0, lambda: status.config(text=f"✅ Freed {freed}"))
+                self.root.after(300, refresh)
+                self.root.after(300, self._fetch_models)  # refresh dropdown marks
+            threading.Thread(target=worker, daemon=True).start()
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=6)
+        ttk.Button(btns, text="🔄 Refresh", command=refresh).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btns, text="🗑 Delete selected", command=delete_selected).pack(side=tk.LEFT, padx=5)
+        refresh()
 
     def _on_preset_selected(self, _event=None) -> None:
         """When a preset label is picked, sync precision to its suggestion."""
@@ -392,8 +509,9 @@ class ImageEditorClient:
         self.edit_btn.config(state="disabled")
         self.browse_btn.config(state="disabled")
         self.save_btn.config(state="disabled")
+        self.progress_bar.config(mode="indeterminate")
         self.progress_bar.start()
-        self.status_label.config(text="🎨 Sending to server…")
+        self.status_label.config(text="📤 Uploading image to server…")
 
         params = {
             "prompt": prompt,
@@ -403,7 +521,43 @@ class ImageEditorClient:
             "seed": self.seed_var.get(),
         }
 
+        # Start polling the server for live inference progress.
+        self._poll_progress = True
+        threading.Thread(target=self._progress_poller, daemon=True).start()
         threading.Thread(target=self._request_edit, args=(params,), daemon=True).start()
+
+    def _progress_poller(self) -> None:
+        """Poll /progress while an edit runs and reflect stage/step in the UI."""
+        import time as _t
+        while self._poll_progress:
+            try:
+                data = requests.get(
+                    f"{self.base_url()}/progress", headers=self.auth_headers(), timeout=5
+                ).json()
+            except Exception:
+                _t.sleep(0.6)
+                continue
+            if not self._poll_progress:
+                break
+            self.root.after(0, lambda d=data: self._apply_progress(d))
+            _t.sleep(0.6)
+
+    def _apply_progress(self, data: dict) -> None:
+        if not self.is_processing:
+            return
+        stage = data.get("stage", "")
+        step = data.get("step", 0)
+        total = data.get("total", 0)
+        if stage == "denoising" and total:
+            # Switch to a determinate bar showing step X / Y.
+            if self.progress_bar["mode"] != "determinate":
+                self.progress_bar.stop()
+                self.progress_bar.config(mode="determinate", maximum=total)
+            self.progress_bar["value"] = step
+            pct = int(step / total * 100)
+            self.status_label.config(text=f"🎨 Denoising step {step}/{total} ({pct}%)")
+        elif stage == "preparing":
+            self.status_label.config(text="🧠 Server preparing (encoding prompt/image)…")
 
     def _request_edit(self, params: dict) -> None:
         try:
@@ -434,9 +588,15 @@ class ImageEditorClient:
             msg = str(exc)
             self.root.after(0, lambda: self._edit_error(msg))
 
+    def _reset_progress_bar(self) -> None:
+        self._poll_progress = False
+        self.progress_bar.stop()
+        self.progress_bar.config(mode="indeterminate")
+        self.progress_bar["value"] = 0
+
     def _edit_success(self) -> None:
         self.is_processing = False
-        self.progress_bar.stop()
+        self._reset_progress_bar()
         self._show_on_canvas(self.output_canvas, self.output_image)
         w, h = self.output_image.size
         self.output_label.config(text=f"✨ Edited Image\n📐 {w}×{h} pixels")
@@ -447,7 +607,7 @@ class ImageEditorClient:
 
     def _edit_error(self, msg: str) -> None:
         self.is_processing = False
-        self.progress_bar.stop()
+        self._reset_progress_bar()
         self.status_label.config(text="❌ Failed.")
         self.edit_btn.config(state="normal")
         self.browse_btn.config(state="normal")

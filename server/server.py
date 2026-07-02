@@ -45,7 +45,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from PIL import Image
 
-from model_manager import DEFAULT_MODEL_ID, DEFAULT_PRECISION, ModelManager
+from model_manager import (
+    DEFAULT_MODEL_ID,
+    DEFAULT_PRECISION,
+    ModelManager,
+    delete_cached_model,
+    list_cached_models,
+    validate_model,
+)
 
 # Suggested models for the client's dropdown. The first is the default.
 SUGGESTED_MODELS = [
@@ -102,7 +109,50 @@ def health() -> JSONResponse:
 
 @app.get("/models")
 def models() -> JSONResponse:
-    return JSONResponse({"models": SUGGESTED_MODELS})
+    # Annotate each suggestion with whether it's already downloaded.
+    cached = {m["repo_id"] for m in list_cached_models()}
+    items = [dict(m, cached=(m["model_id"] in cached)) for m in SUGGESTED_MODELS]
+    return JSONResponse({"models": items})
+
+
+@app.get("/progress")
+def progress() -> JSONResponse:
+    return JSONResponse(manager.progress)
+
+
+@app.get("/cache")
+def cache() -> JSONResponse:
+    """List models already downloaded to the HF cache (with sizes)."""
+    return JSONResponse({"models": list_cached_models()})
+
+
+class DeleteRequest(BaseModel):
+    repo_id: str
+
+
+@app.post("/cache/delete")
+def cache_delete(req: DeleteRequest, x_api_key: str | None = Header(default=None)) -> JSONResponse:
+    _check_api_key(x_api_key)
+    if manager.state.model_id == req.repo_id and manager.is_ready:
+        raise HTTPException(
+            status_code=409,
+            detail="That model is currently loaded. Load a different model first.",
+        )
+    try:
+        info = delete_cached_model(req.repo_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc))
+    return JSONResponse(info)
+
+
+class ValidateRequest(BaseModel):
+    model_id: str
+
+
+@app.post("/validate")
+def validate(req: ValidateRequest, x_api_key: str | None = Header(default=None)) -> JSONResponse:
+    _check_api_key(x_api_key)
+    return JSONResponse(validate_model(req.model_id))
 
 
 class LoadRequest(BaseModel):
