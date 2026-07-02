@@ -18,6 +18,12 @@ safetensors>=0.4.0
 #   pip install bitsandbytes>=0.43.0
 bitsandbytes>=0.43.0
 
+# GGUF K-quant loading (required for QIE_PRECISION=gguf — the recommended mode).
+# Also needs a recent diffusers (2511 GGUF fix landed in diffusers PR #12894);
+# if 'gguf' precision errors on load, install diffusers from git:
+#   pip install -U git+https://github.com/huggingface/diffusers
+gguf>=0.10.0
+
 # API server
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0

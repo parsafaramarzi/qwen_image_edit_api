@@ -29,11 +29,16 @@ Precision is configurable through the ``QIE_PRECISION`` environment variable:
     sensitive), so edits can look softer/noisier.
   * ``8bit``  — int8 quantized. Higher fidelity, but the transformer alone is
     ~20 GB so it does NOT fit a 24 GB card alongside the text encoder.
+  * ``gguf`` — GGUF K-quant transformer (default Q6_K, ~17 GB) loaded from a
+    single .gguf file, rest of the pipeline in bf16. Higher quality-per-bit than
+    bnb 4-bit AND fully GPU-resident, so it's near-full quality at full speed —
+    the sweet spot for a 24 GB card. Needs a recent diffusers + the ``gguf``
+    package. Pick the quant via QIE_GGUF_FILE / QIE_GGUF_REPO.
   * ``max`` / ``bf16`` — FULL precision, no quantization. On a small GPU this
     uses sequential CPU offload: the complete bf16 weights live in system RAM
     (~57 GB, needs a 64 GB box) and stream through the GPU layer-by-layer.
-    Highest possible quality; slower per image (a few minutes) because weights
-    cross the PCIe bus each step. This is the max quality a 24 GB GPU can run.
+    Highest possible quality; slowest per image (weights cross the PCIe bus
+    every step). Use ``gguf`` instead unless you need bit-exact full precision.
 """
 
 from __future__ import annotations
@@ -156,6 +161,99 @@ def _build_quant_config(precision: str):
     )
 
 
+# GGUF defaults. Q6_K is the sweet spot for a 24 GB GPU: ~17 GB, near-full
+# quality, fully resident (fast). Change the quant with QIE_GGUF_QUANT
+# (e.g. Q8_0, Q5_K_M, Q4_K_M), or pin an exact file with QIE_GGUF_FILE.
+DEFAULT_GGUF_REPO = os.environ.get(
+    "QIE_GGUF_REPO", "QuantStack/Qwen-Image-Edit-2511-GGUF"
+)
+DEFAULT_GGUF_QUANT = os.environ.get("QIE_GGUF_QUANT", "Q6_K")
+# If set, use this exact filename; otherwise auto-discover by quant tag.
+DEFAULT_GGUF_FILE = os.environ.get("QIE_GGUF_FILE", "").strip()
+
+
+def _resolve_gguf_filename(repo: str, explicit: str, quant: str) -> str:
+    """Return the .gguf filename to download.
+
+    Naming across GGUF repos is inconsistent (hyphens vs underscores, casing),
+    so unless an exact file is pinned we list the repo and match by quant tag.
+    """
+    if explicit:
+        return explicit
+
+    from huggingface_hub import list_repo_files
+
+    files = [f for f in list_repo_files(repo) if f.lower().endswith(".gguf")]
+    if not files:
+        raise RuntimeError(f"No .gguf files found in repo '{repo}'.")
+
+    tag = quant.lower().replace("-", "_")
+    matches = [f for f in files if tag in f.lower().replace("-", "_")]
+    if not matches:
+        raise RuntimeError(
+            f"No GGUF file matching quant '{quant}' in '{repo}'. "
+            f"Available: {', '.join(sorted(files))}. "
+            f"Set QIE_GGUF_QUANT to one of these or QIE_GGUF_FILE to an exact name."
+        )
+    # Prefer the shortest match (avoids picking multi-part split files if a
+    # single-file variant exists).
+    return sorted(matches, key=len)[0]
+
+
+def _build_gguf_pipeline(model_id: str):
+    """Load a GGUF-quantized transformer + the rest of the pipeline from HF.
+
+    Requires a recent diffusers (the 2511 GGUF loader fix landed in
+    huggingface/diffusers PR #12894 — a released version may be too old, in
+    which case install from git) and the ``gguf`` package.
+    """
+    try:
+        from diffusers import GGUFQuantizationConfig, QwenImageTransformer2DModel
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "GGUF loading needs a recent diffusers with GGUFQuantizationConfig. "
+            "Install the latest: pip install -U 'diffusers[gguf]' gguf  "
+            "(or from git: pip install git+https://github.com/huggingface/diffusers)"
+        ) from exc
+
+    if QwenImageEditPlusPipeline is None:
+        raise RuntimeError(
+            "GGUF mode targets the 2511 'Plus' pipeline, which this diffusers "
+            "version lacks. Upgrade: pip install -U diffusers"
+        )
+
+    from huggingface_hub import hf_hub_download
+
+    # The GGUF file only holds the transformer; the text encoder, VAE, tokenizer
+    # and config come from the base HF repo.
+    base_model = os.environ.get("QIE_GGUF_BASE", model_id)
+    if base_model.lower() in ("qwen/qwen-image-edit", ""):
+        # A GGUF repo is 2511/2509-based; default the base to 2511 so configs match.
+        base_model = "Qwen/Qwen-Image-Edit-2511"
+
+    filename = _resolve_gguf_filename(
+        DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE, DEFAULT_GGUF_QUANT
+    )
+    print(f"📥 Fetching GGUF transformer {DEFAULT_GGUF_REPO}/{filename} ...")
+    gguf_path = hf_hub_download(repo_id=DEFAULT_GGUF_REPO, filename=filename)
+
+    print(f"🔧 Loading GGUF transformer (base config: {base_model}) ...")
+    transformer = QwenImageTransformer2DModel.from_single_file(
+        gguf_path,
+        quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+        config=base_model,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16,
+    )
+
+    pipeline = QwenImageEditPlusPipeline.from_pretrained(
+        base_model,
+        transformer=transformer,
+        torch_dtype=torch.bfloat16,
+    )
+    return pipeline
+
+
 class ModelManager:
     """Owns the pipeline lifecycle and serialises inference calls."""
 
@@ -189,31 +287,41 @@ class ModelManager:
                 device = _select_device()
                 self.state.device = device
 
-                load_kwargs = {
-                    "torch_dtype": torch.bfloat16,   # never load fp32 then convert
-                    "low_cpu_mem_usage": True,       # stream shards, no fp32 spike
-                }
-
-                quant_config = _build_quant_config(self.state.precision)
-                if quant_config is not None:
-                    load_kwargs["quantization_config"] = quant_config
-
-                # Pick the right pipeline class for the model revision.
-                self._is_plus = _uses_plus_pipeline(self.state.model_id)
-                if self._is_plus:
-                    if QwenImageEditPlusPipeline is None:
-                        raise RuntimeError(
-                            f"{self.state.model_id} needs QwenImageEditPlusPipeline, "
-                            "which this diffusers version lacks. Upgrade with: "
-                            "pip install -U diffusers"
-                        )
-                    pipeline_cls = QwenImageEditPlusPipeline
+                if self.state.precision == "gguf":
+                    # GGUF: load a K-quant transformer from a single .gguf file
+                    # (higher quality-per-bit than bnb 4-bit) and pull the rest
+                    # of the pipeline from the HF repo. Best quality/speed on a
+                    # 24 GB GPU — near full-precision, but fully resident (fast).
+                    pipeline = _build_gguf_pipeline(self.state.model_id)
+                    self._is_plus = _uses_plus_pipeline(
+                        os.environ.get("QIE_GGUF_BASE", self.state.model_id)
+                    )
                 else:
-                    pipeline_cls = QwenImageEditPipeline
+                    load_kwargs = {
+                        "torch_dtype": torch.bfloat16,   # never load fp32 then convert
+                        "low_cpu_mem_usage": True,       # stream shards, no fp32 spike
+                    }
 
-                pipeline = pipeline_cls.from_pretrained(
-                    self.state.model_id, **load_kwargs
-                )
+                    quant_config = _build_quant_config(self.state.precision)
+                    if quant_config is not None:
+                        load_kwargs["quantization_config"] = quant_config
+
+                    # Pick the right pipeline class for the model revision.
+                    self._is_plus = _uses_plus_pipeline(self.state.model_id)
+                    if self._is_plus:
+                        if QwenImageEditPlusPipeline is None:
+                            raise RuntimeError(
+                                f"{self.state.model_id} needs QwenImageEditPlusPipeline, "
+                                "which this diffusers version lacks. Upgrade with: "
+                                "pip install -U diffusers"
+                            )
+                        pipeline_cls = QwenImageEditPlusPipeline
+                    else:
+                        pipeline_cls = QwenImageEditPipeline
+
+                    pipeline = pipeline_cls.from_pretrained(
+                        self.state.model_id, **load_kwargs
+                    )
 
                 if device == "cuda":
                     if self.state.precision in ("bf16", "max"):
