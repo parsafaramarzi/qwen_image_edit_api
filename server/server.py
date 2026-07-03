@@ -91,9 +91,15 @@ manager = ModelManager(model_id=DEFAULT_MODEL_ID, precision=DEFAULT_PRECISION)
 
 @app.on_event("startup")
 def _startup() -> None:
-    # Load in the background so the server can answer /health immediately and
-    # report loading progress instead of blocking the boot.
-    manager.load_in_background()
+    # Boot idle — do NOT preload a model. The client chooses and loads one on
+    # demand via POST /load. Set QIE_AUTOLOAD=1 to restore boot-time preload.
+    if os.environ.get("QIE_AUTOLOAD", "0").lower() in ("1", "true", "yes"):
+        manager.load_in_background()
+    else:
+        manager.state.status = "idle"
+        manager.state.model_id = ""
+        manager.state.precision = ""
+        manager.state.message = "No model loaded — load one from the client."
 
 
 def _check_api_key(provided: str | None) -> None:
@@ -295,8 +301,12 @@ def main() -> None:
         ssl_kwargs = {"ssl_certfile": ssl_cert, "ssl_keyfile": ssl_key}
         scheme = "https"
 
+    autoload = os.environ.get("QIE_AUTOLOAD", "0").lower() in ("1", "true", "yes")
     print(f"🚀 Starting Qwen Image Edit API on {scheme}://{host}:{port}")
-    print(f"   Model: {DEFAULT_MODEL_ID}  |  Precision: {DEFAULT_PRECISION}")
+    if autoload:
+        print(f"   Preloading: {DEFAULT_MODEL_ID}  |  Precision: {DEFAULT_PRECISION}")
+    else:
+        print("   Idle — waiting for the client to load a model (POST /load).")
     if API_KEY:
         print("   🔒 API key required (X-API-Key header).")
     if ssl_kwargs:
