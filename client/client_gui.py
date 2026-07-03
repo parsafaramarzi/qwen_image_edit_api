@@ -39,7 +39,7 @@ except ImportError:
     _DND_AVAILABLE = False
 
 
-DEFAULT_SERVER_URL = os.environ.get("QIE_SERVER_URL", "http://193.93.169.217:8000")
+DEFAULT_SERVER_URL = os.environ.get("QIE_SERVER_URL", "https://193.93.169.217:8000")
 DEFAULT_API_KEY = os.environ.get("QIE_API_KEY", "")
 
 # For self-signed TLS, set QIE_SSL_VERIFY=0 so the client accepts the cert
