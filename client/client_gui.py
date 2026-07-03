@@ -708,11 +708,19 @@ class ImageEditorClient:
 
     @staticmethod
     def _civitai_search(query: str, kind: str):
-        """Search Civitai. Returns [(display, value)]. value = download URL."""
+        """Search Civitai. Returns [(display, value)]. value = download URL.
+
+        Reads QIE_CIVITAI_TOKEN from the environment (never hard-code it) so that
+        gated/NSFW results are included and downloads authenticate.
+        """
         import requests as _rq
         params = {"query": query, "limit": 30}
         params["types"] = "LORA" if kind == "lora" else "Checkpoint"
-        r = _rq.get("https://civitai.com/api/v1/models", params=params, timeout=25)
+        token = os.environ.get("QIE_CIVITAI_TOKEN", "").strip()
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        r = _rq.get(
+            "https://civitai.com/api/v1/models", params=params, headers=headers, timeout=25
+        )
         r.raise_for_status()
         out = []
         for it in r.json().get("items", []):
