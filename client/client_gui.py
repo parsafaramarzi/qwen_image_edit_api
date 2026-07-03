@@ -74,6 +74,41 @@ MODEL_PRESETS = [
 ]
 
 
+def _truncate(text: str, maxlen: int = 36) -> str:
+    """Shorten text with an ellipsis so long filenames don't stretch the UI."""
+    return text if len(text) <= maxlen else text[: maxlen - 1] + "…"
+
+
+class Tooltip:
+    """A Windows-style hover tooltip. `textfunc` returns the current full text."""
+
+    def __init__(self, widget, textfunc):
+        self.widget = widget
+        self.textfunc = textfunc
+        self.tip = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _event=None):
+        text = self.textfunc() if callable(self.textfunc) else self.textfunc
+        if not text or self.tip is not None:
+            return
+        x = self.widget.winfo_rootx() + 15
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 3
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            self.tip, text=text, background="#ffffe0", relief="solid", borderwidth=1,
+            font=("Arial", 9), justify="left", padx=4, pady=2,
+        ).pack()
+
+    def _hide(self, _event=None):
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
 class ImageEditorClient:
     """Tkinter client for the Qwen Image Edit API."""
 
@@ -86,6 +121,7 @@ class ImageEditorClient:
         # Up to MAX_IMAGES input slots (image 1 is the main/target).
         self.input_images: list = [None] * MAX_IMAGES
         self.input_paths: list = [""] * MAX_IMAGES
+        self.input_slot_fulltext: list = [""] * MAX_IMAGES
         self.output_image: Optional[Image.Image] = None
         self.is_processing: bool = False
         self._poll_progress: bool = False
@@ -135,22 +171,27 @@ class ImageEditorClient:
             self.model_frame, textvariable=self.model_var, width=52, state="readonly"
         )
         self.load_model_btn = ttk.Button(self.model_frame, text="⬇️ Load", command=self.load_model)
+        self.unload_model_btn = ttk.Button(self.model_frame, text="⏏ Unload", command=self.unload_model)
         self.downloads_btn = ttk.Button(self.model_frame, text="🗂 Downloads", command=self.open_downloads)
         self.model_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
         self._cached_ids: set = set()
         self._refresh_model_choices()  # populate from the fixed list (works offline)
 
         # LoRA row (optional): a Hugging Face repo id ("repo::file.safetensors")
-        # or a direct URL (e.g. a Civitai download link) + a strength.
-        ttk.Label(self.model_frame, text="LoRA (URL/repo, optional):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        # or a direct URL (e.g. a Civitai download link) + a strength. The LoRA
+        # can be loaded/unloaded on the already-loaded model with its own buttons.
+        ttk.Label(self.model_frame, text="LoRA (URL/repo):").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.lora_var = tk.StringVar(value=self._settings.get("lora", ""))
-        self.lora_entry = ttk.Entry(self.model_frame, textvariable=self.lora_var, width=52)
+        self.lora_entry = ttk.Entry(self.model_frame, textvariable=self.lora_var, width=40)
         ttk.Label(self.model_frame, text="Strength:").grid(row=1, column=2, sticky="e", pady=(6, 0))
         self.lora_scale_var = tk.DoubleVar(value=float(self._settings.get("lora_scale", 1.0)))
         self.lora_scale_spin = ttk.Spinbox(
             self.model_frame, from_=0.0, to=2.0, increment=0.05,
             textvariable=self.lora_scale_var, width=6,
         )
+        self.lora_load_btn = ttk.Button(self.model_frame, text="🎨 Load LoRA", command=self.load_lora)
+        self.lora_unload_btn = ttk.Button(self.model_frame, text="⏏ Unload LoRA", command=self.unload_lora)
+        self.lora_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
 
         # Input images (up to MAX_IMAGES). Slot 0 is the main/target image.
         self.input_frame = ttk.LabelFrame(
@@ -162,11 +203,15 @@ class ImageEditorClient:
             slot = ttk.Frame(self.input_frame)
             slot.pack(pady=3, fill=tk.X)
             role = "main" if i == 0 else "optional"
+            base = f"Image {i + 1} ({role})"
+            self.input_slot_fulltext[i] = base
             cv = tk.Canvas(slot, width=250, height=118, bg="#f0f0f0", highlightthickness=1,
                            highlightbackground="#cccccc")
             cv.grid(row=0, column=0, rowspan=2, padx=(0, 6))
-            lbl = ttk.Label(slot, text=f"Image {i + 1} ({role})", font=("Arial", 9))
+            lbl = ttk.Label(slot, text=base, font=("Arial", 9))
             lbl.grid(row=0, column=1, sticky="sw")
+            # Hover shows the full (untruncated) label text.
+            Tooltip(lbl, lambda i=i: self.input_slot_fulltext[i])
             btns = ttk.Frame(slot)
             btns.grid(row=1, column=1, sticky="nw")
             ttk.Button(btns, text="📂 Browse", width=9,
@@ -229,11 +274,15 @@ class ImageEditorClient:
 
         self.model_frame.pack(fill=tk.X, pady=(0, 10))
         self.model_combo.grid(row=0, column=1, padx=5)
-        self.load_model_btn.grid(row=0, column=2, padx=5)
-        self.downloads_btn.grid(row=0, column=3, padx=2)
-        self.model_status.grid(row=0, column=4, padx=10, sticky="w")
+        self.load_model_btn.grid(row=0, column=2, padx=2)
+        self.unload_model_btn.grid(row=0, column=3, padx=2)
+        self.downloads_btn.grid(row=0, column=4, padx=2)
+        self.model_status.grid(row=0, column=5, padx=10, sticky="w")
         self.lora_entry.grid(row=1, column=1, padx=5, pady=(6, 0), sticky="w")
-        self.lora_scale_spin.grid(row=1, column=3, padx=5, pady=(6, 0), sticky="w")
+        self.lora_scale_spin.grid(row=1, column=3, padx=2, pady=(6, 0), sticky="w")
+        self.lora_load_btn.grid(row=1, column=4, padx=2, pady=(6, 0))
+        self.lora_unload_btn.grid(row=1, column=5, padx=2, pady=(6, 0), sticky="w")
+        self.lora_status.grid(row=2, column=1, columnspan=5, padx=5, sticky="w")
 
         content_frame = ttk.Frame(self.main_frame)
         content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -491,6 +540,96 @@ class ImageEditorClient:
         self.model_status.config(text=text)
         self.load_model_btn.config(state="normal")
 
+    def unload_model(self) -> None:
+        """Free the model on the server (releases VRAM)."""
+        if not messagebox.askyesno("Unload model", "Unload the model and free server VRAM?"):
+            return
+        self.model_status.config(text="⏏ Unloading…")
+
+        def worker():
+            try:
+                self.session.post(
+                    f"{self.base_url()}/model/unload", headers=self.auth_headers(), timeout=30
+                ).raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                self.root.after(0, lambda: self.model_status.config(text=f"🔴 {msg}"))
+                return
+            self.root.after(0, lambda: self.model_status.config(text="⚪ Model unloaded"))
+            self.root.after(0, self.check_server)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------------------ #
+    # LoRA (apply/remove on the loaded model)
+    # ------------------------------------------------------------------ #
+    def load_lora(self) -> None:
+        lora = self.lora_var.get().strip()
+        if not lora:
+            messagebox.showwarning("No LoRA", "Enter a LoRA URL or HF repo id first.")
+            return
+        scale = self.lora_scale_var.get()
+        self._settings["lora"] = lora
+        self._settings["lora_scale"] = scale
+        self._save_settings()
+        self.lora_load_btn.config(state="disabled")
+        self.lora_status.config(text="🎨 Requesting LoRA…")
+
+        def worker():
+            try:
+                self.session.post(
+                    f"{self.base_url()}/lora/load",
+                    json={"lora_source": lora, "lora_scale": scale},
+                    headers=self.auth_headers(), timeout=30,
+                ).raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                self.root.after(0, lambda: self._lora_done(f"🔴 {msg}"))
+                return
+
+            import time as _t
+            deadline = _t.time() + 900
+            while _t.time() < deadline:
+                try:
+                    info = self.session.get(
+                        f"{self.base_url()}/health", headers=self.auth_headers(), timeout=10
+                    ).json().get("lora", {})
+                except Exception:
+                    _t.sleep(2)
+                    continue
+                st = info.get("status", "")
+                if st == "active":
+                    self.root.after(0, lambda: self._lora_done("🟢 LoRA active"))
+                    return
+                if st.startswith("failed"):
+                    self.root.after(0, lambda s=st: self._lora_done(f"🔴 {s}"))
+                    return
+                self.root.after(0, lambda: self.lora_status.config(text="🟡 Loading LoRA…"))
+                _t.sleep(2)
+            self.root.after(0, lambda: self._lora_done("🔴 LoRA load timed out."))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def unload_lora(self) -> None:
+        self.lora_status.config(text="⏏ Removing LoRA…")
+
+        def worker():
+            try:
+                self.session.post(
+                    f"{self.base_url()}/lora/unload", headers=self.auth_headers(), timeout=20
+                ).raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                self.root.after(0, lambda: self._lora_done(f"🔴 {msg}"))
+                return
+            self.root.after(0, lambda: self._lora_done("⚪ LoRA removed"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _lora_done(self, text: str) -> None:
+        self.lora_status.config(text=text)
+        self.lora_load_btn.config(state="normal")
+
     # ------------------------------------------------------------------ #
     # Settings persistence (remembered folders)
     # ------------------------------------------------------------------ #
@@ -555,9 +694,9 @@ class ImageEditorClient:
             self._show_on_canvas(self.input_canvases[idx], img, size=(250, 118))
             w, h = img.size
             role = "main" if idx == 0 else "optional"
-            self.input_slot_labels[idx].config(
-                text=f"Image {idx + 1} ({role}) · {os.path.basename(filepath)} · {w}×{h}"
-            )
+            full = f"Image {idx + 1} ({role}) · {os.path.basename(filepath)} · {w}×{h}"
+            self.input_slot_fulltext[idx] = full          # shown in the hover tooltip
+            self.input_slot_labels[idx].config(text=_truncate(full))
             self._settings["input_dir"] = os.path.dirname(filepath)
             self._save_settings()
         except Exception as exc:  # noqa: BLE001
@@ -568,7 +707,9 @@ class ImageEditorClient:
         self.input_paths[idx] = ""
         self.input_canvases[idx].delete("all")
         role = "main" if idx == 0 else "optional"
-        self.input_slot_labels[idx].config(text=f"Image {idx + 1} ({role})")
+        base = f"Image {idx + 1} ({role})"
+        self.input_slot_fulltext[idx] = base
+        self.input_slot_labels[idx].config(text=base)
 
     def _show_on_canvas(self, canvas: tk.Canvas, image: Image.Image, size=(300, 300)) -> None:
         display = self._resize_for_display(image, size[0], size[1])

@@ -385,6 +385,8 @@ class ModelManager:
         # Optional LoRA (URL/repo + strength), applied after the base model.
         self._lora_source = os.environ.get("QIE_LORA", "").strip()
         self._lora_scale = float(os.environ.get("QIE_LORA_SCALE", "1.0"))
+        self._lora_active = False
+        self._lora_status = "none"   # none | loading | active | failed: ...
         # Live inference progress (polled by the client via /progress).
         self._progress = {"active": False, "stage": "idle", "step": 0, "total": 0}
         # Only one inference at a time — the model is a single shared GPU resource.
@@ -394,6 +396,76 @@ class ModelManager:
     @property
     def progress(self) -> dict:
         return dict(self._progress)
+
+    def lora_info(self) -> dict:
+        return {
+            "active": self._lora_active,
+            "status": self._lora_status,
+            "source": self._lora_source,
+            "scale": self._lora_scale,
+        }
+
+    # ------------------------------------------------------------------ #
+    # LoRA (apply/remove on the already-loaded model)
+    # ------------------------------------------------------------------ #
+    def apply_lora(self, source: str, scale: float) -> None:
+        """Download + apply a LoRA to the current pipeline, in the background."""
+        source = (source or "").strip()
+
+        def worker():
+            with self._load_lock:
+                if not self.is_ready:
+                    self._lora_status = "failed: no model loaded"
+                    return
+                self._lora_status = "loading"
+                try:
+                    path, weight_name = _resolve_lora(source)
+                    kwargs = {"adapter_name": "custom"}
+                    if weight_name:
+                        kwargs["weight_name"] = weight_name
+                    with self._infer_lock:
+                        try:
+                            self._pipeline.unload_lora_weights()
+                        except Exception:
+                            pass
+                        self._pipeline.load_lora_weights(path, **kwargs)
+                        try:
+                            self._pipeline.set_adapters("custom", float(scale))
+                        except Exception:
+                            pass
+                    self._lora_source = source
+                    self._lora_scale = float(scale)
+                    self._lora_active = True
+                    self._lora_status = "active"
+                    print(f"✅ LoRA applied: {source} (scale {scale})")
+                except Exception as exc:  # noqa: BLE001
+                    self._lora_active = False
+                    self._lora_status = f"failed: {exc}"
+                    print(f"❌ LoRA failed: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def remove_lora(self) -> None:
+        """Remove any applied LoRA from the current pipeline."""
+        with self._infer_lock:
+            if self._pipeline is not None:
+                try:
+                    self._pipeline.unload_lora_weights()
+                except Exception:
+                    pass
+        self._lora_active = False
+        self._lora_source = ""
+        self._lora_status = "none"
+
+    def unload_model(self) -> None:
+        """Free the current model + VRAM; server goes back to an idle state."""
+        with self._load_lock:
+            self._teardown()
+            self._lora_active = False
+            self._lora_status = "none"
+            self.state = LoadState(
+                status="idle", message="No model loaded.", model_id="", precision=""
+            )
 
     # ------------------------------------------------------------------ #
     # Loading
@@ -567,6 +639,8 @@ class ModelManager:
         works; we just note that the LoRA couldn't be applied (common on GGUF).
         """
         if not self._lora_source:
+            self._lora_active = False
+            self._lora_status = "none"
             return ""
         try:
             path, weight_name = _resolve_lora(self._lora_source)
@@ -579,9 +653,13 @@ class ModelManager:
                 pipeline.set_adapters("custom", self._lora_scale)
             except Exception:
                 pass  # some versions apply at load; scale then defaults to 1.0
+            self._lora_active = True
+            self._lora_status = "active"
             return f" + LoRA (scale {self._lora_scale})"
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️  LoRA not applied: {exc}")
+            self._lora_active = False
+            self._lora_status = f"failed: {exc}"
             return f" [LoRA FAILED: {exc}]"
 
     def _apply_offload(self, pipeline, device: str) -> None:

@@ -104,6 +104,40 @@ def _check_api_key(provided: str | None) -> None:
 @app.get("/health")
 @app.get("/status")
 def health() -> JSONResponse:
+    data = manager.state.as_dict()
+    data["lora"] = manager.lora_info()
+    return JSONResponse(data)
+
+
+class LoraRequest(BaseModel):
+    lora_source: str
+    lora_scale: float = 1.0
+
+
+@app.post("/lora/load")
+def lora_load(req: LoraRequest, x_api_key: str | None = Header(default=None)) -> JSONResponse:
+    """Apply a LoRA to the already-loaded model (async; poll /health.lora)."""
+    _check_api_key(x_api_key)
+    if not manager.is_ready:
+        raise HTTPException(status_code=409, detail="Load a model first.")
+    if not req.lora_source.strip():
+        raise HTTPException(status_code=400, detail="lora_source is required.")
+    manager.apply_lora(req.lora_source, req.lora_scale)
+    return JSONResponse(manager.lora_info())
+
+
+@app.post("/lora/unload")
+def lora_unload(x_api_key: str | None = Header(default=None)) -> JSONResponse:
+    _check_api_key(x_api_key)
+    manager.remove_lora()
+    return JSONResponse(manager.lora_info())
+
+
+@app.post("/model/unload")
+def model_unload(x_api_key: str | None = Header(default=None)) -> JSONResponse:
+    """Free the model + VRAM. Server returns to idle until a model is loaded."""
+    _check_api_key(x_api_key)
+    manager.unload_model()
     return JSONResponse(manager.state.as_dict())
 
 
