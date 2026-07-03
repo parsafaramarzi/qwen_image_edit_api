@@ -168,8 +168,12 @@ class ImageEditorClient:
         self.unload_model_btn = ttk.Button(self.model_frame, text="⏏ Unload", command=self.unload_model)
         self.downloads_btn = ttk.Button(self.model_frame, text="🗂 Downloads", command=self.open_downloads)
         self.explore_model_btn = ttk.Button(
-            self.model_frame, text="🔍 Explore HF",
+            self.model_frame, text="🔍 HF",
             command=lambda: self._open_search("hf", "model", "model"),
+        )
+        self.explore_model_civitai_btn = ttk.Button(
+            self.model_frame, text="🔍 Civitai",
+            command=lambda: self._open_search("civitai", "model", "model"),
         )
         self.model_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
         self._cached_models: list = []
@@ -296,7 +300,8 @@ class ImageEditorClient:
         self.unload_model_btn.grid(row=0, column=3, padx=2)
         self.downloads_btn.grid(row=0, column=4, padx=2)
         self.explore_model_btn.grid(row=0, column=5, padx=2)
-        self.model_status.grid(row=0, column=6, padx=10, sticky="w")
+        self.explore_model_civitai_btn.grid(row=0, column=6, padx=2)
+        self.model_status.grid(row=0, column=7, padx=10, sticky="w")
         # Custom-model row (widgets gridded/enabled by _sync_custom_row()).
         self.custom_lbl.grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.custom_model_entry.grid(row=1, column=1, padx=5, pady=(4, 0), sticky="w")
