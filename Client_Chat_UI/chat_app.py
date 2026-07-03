@@ -223,19 +223,28 @@ def action_generate(images, prompt, params, prog_box):
 # Session state
 # --------------------------------------------------------------------------- #
 def init_state():
+    # Explicit "if key not in state" — st.session_state.setdefault() is not
+    # reliable in the live runtime, so set each key directly.
     ss = st.session_state
-    ss.setdefault("server_url", DEFAULT_SERVER_URL)
-    ss.setdefault("api_key", DEFAULT_API_KEY)
-    ss.setdefault("pending", [])          # list of image file paths queued as input
-    ss.setdefault("uploader_key", 0)      # bumped to reset the file_uploader
-    ss.setdefault("settings", {
-        "steps": 40, "cfg": 4.0, "seed": 0, "negative": "",
-        "width": 0, "height": 0,
-    })
-    chats = load_all_chats()
-    if not chats:
-        chats = [new_chat()]
-    ss.setdefault("current_chat_id", chats[0]["id"])
+    defaults = {
+        "server_url": DEFAULT_SERVER_URL,
+        "api_key": DEFAULT_API_KEY,
+        "pending": [],          # image file paths queued as input for next prompt
+        "uploader_key": 0,      # bumped to reset the file_uploader
+        "custom_model": "",
+        "lora": "",
+        "lora_scale": 1.0,
+        "settings": {
+            "steps": 40, "cfg": 4.0, "seed": 0, "negative": "",
+            "width": 0, "height": 0,
+        },
+    }
+    for key, value in defaults.items():
+        if key not in ss:
+            ss[key] = value
+    if "current_chat_id" not in ss:
+        chats = load_all_chats() or [new_chat()]
+        ss["current_chat_id"] = chats[0]["id"]
 
 
 def current_chat() -> dict:
