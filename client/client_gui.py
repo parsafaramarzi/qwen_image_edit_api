@@ -73,6 +73,9 @@ MODEL_PRESETS = [
      "Qwen/Qwen-Image-Edit", "4bit", ""),
 ]
 
+# Appended after the presets; selecting it enables the custom repo fields.
+CUSTOM_LABEL = "➕ Custom model (enter repo below)…"
+
 
 def _truncate(text: str, maxlen: int = 36) -> str:
     """Shorten text with an ellipsis so long filenames don't stretch the UI."""
@@ -163,27 +166,42 @@ class ImageEditorClient:
         self.connect_btn = ttk.Button(self.server_frame, text="🔌 Check", command=self.check_server)
         self.server_status = ttk.Label(self.server_frame, text="⚪ Not checked", font=("Arial", 9))
 
-        # Model selection bar — a fixed, curated list (read-only).
+        # Model selection bar — curated list + a "Custom model…" escape hatch.
         self.model_frame = ttk.LabelFrame(self.main_frame, text="🧠 Model", padding="5")
         ttk.Label(self.model_frame, text="Model:").grid(row=0, column=0, sticky="w")
         self.model_var = tk.StringVar(value="")
         self.model_combo = ttk.Combobox(
             self.model_frame, textvariable=self.model_var, width=52, state="readonly"
         )
+        self.model_combo.bind("<<ComboboxSelected>>", lambda e: self._sync_custom_row())
         self.load_model_btn = ttk.Button(self.model_frame, text="⬇️ Load", command=self.load_model)
         self.unload_model_btn = ttk.Button(self.model_frame, text="⏏ Unload", command=self.unload_model)
         self.downloads_btn = ttk.Button(self.model_frame, text="🗂 Downloads", command=self.open_downloads)
+        self.explore_model_btn = ttk.Button(
+            self.model_frame, text="🔍 Explore HF",
+            command=lambda: self._open_search("hf", "model", "model"),
+        )
         self.model_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
         self._cached_ids: set = set()
+
+        # Custom-model row (enabled only when "➕ Custom model…" is selected).
+        self.custom_lbl = ttk.Label(self.model_frame, text="Custom repo:")
+        self.custom_model_var = tk.StringVar(value=self._settings.get("custom_model", ""))
+        self.custom_model_entry = ttk.Entry(self.model_frame, textvariable=self.custom_model_var, width=40)
+        self.custom_precision_var = tk.StringVar(value=self._settings.get("custom_precision", "4bit"))
+        self.custom_precision_combo = ttk.Combobox(
+            self.model_frame, textvariable=self.custom_precision_var, width=7, state="readonly",
+            values=["gguf", "4bit", "8bit", "bf16", "max"],
+        )
         self._refresh_model_choices()  # populate from the fixed list (works offline)
 
         # LoRA row (optional): a Hugging Face repo id ("repo::file.safetensors")
         # or a direct URL (e.g. a Civitai download link) + a strength. The LoRA
         # can be loaded/unloaded on the already-loaded model with its own buttons.
-        ttk.Label(self.model_frame, text="LoRA (URL/repo):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(self.model_frame, text="LoRA (URL/repo):").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.lora_var = tk.StringVar(value=self._settings.get("lora", ""))
         self.lora_entry = ttk.Entry(self.model_frame, textvariable=self.lora_var, width=40)
-        ttk.Label(self.model_frame, text="Strength:").grid(row=1, column=2, sticky="e", pady=(6, 0))
+        ttk.Label(self.model_frame, text="Strength:").grid(row=2, column=2, sticky="e", pady=(6, 0))
         self.lora_scale_var = tk.DoubleVar(value=float(self._settings.get("lora_scale", 1.0)))
         self.lora_scale_spin = ttk.Spinbox(
             self.model_frame, from_=0.0, to=2.0, increment=0.05,
@@ -191,6 +209,14 @@ class ImageEditorClient:
         )
         self.lora_load_btn = ttk.Button(self.model_frame, text="🎨 Load LoRA", command=self.load_lora)
         self.lora_unload_btn = ttk.Button(self.model_frame, text="⏏ Unload LoRA", command=self.unload_lora)
+        self.lora_hf_btn = ttk.Button(
+            self.model_frame, text="🔍 HF",
+            command=lambda: self._open_search("hf", "lora", "lora"),
+        )
+        self.lora_civitai_btn = ttk.Button(
+            self.model_frame, text="🔍 Civitai",
+            command=lambda: self._open_search("civitai", "lora", "lora"),
+        )
         self.lora_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
 
         # Input images (up to MAX_IMAGES). Slot 0 is the main/target image.
@@ -277,12 +303,20 @@ class ImageEditorClient:
         self.load_model_btn.grid(row=0, column=2, padx=2)
         self.unload_model_btn.grid(row=0, column=3, padx=2)
         self.downloads_btn.grid(row=0, column=4, padx=2)
-        self.model_status.grid(row=0, column=5, padx=10, sticky="w")
-        self.lora_entry.grid(row=1, column=1, padx=5, pady=(6, 0), sticky="w")
-        self.lora_scale_spin.grid(row=1, column=3, padx=2, pady=(6, 0), sticky="w")
-        self.lora_load_btn.grid(row=1, column=4, padx=2, pady=(6, 0))
-        self.lora_unload_btn.grid(row=1, column=5, padx=2, pady=(6, 0), sticky="w")
-        self.lora_status.grid(row=2, column=1, columnspan=5, padx=5, sticky="w")
+        self.explore_model_btn.grid(row=0, column=5, padx=2)
+        self.model_status.grid(row=0, column=6, padx=10, sticky="w")
+        # Custom-model row (widgets gridded/enabled by _sync_custom_row()).
+        self.custom_lbl.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.custom_model_entry.grid(row=1, column=1, padx=5, pady=(4, 0), sticky="w")
+        self.custom_precision_combo.grid(row=1, column=2, padx=2, pady=(4, 0), sticky="w")
+        self.lora_entry.grid(row=2, column=1, padx=5, pady=(6, 0), sticky="w")
+        self.lora_scale_spin.grid(row=2, column=3, padx=2, pady=(6, 0), sticky="w")
+        self.lora_load_btn.grid(row=2, column=4, padx=2, pady=(6, 0))
+        self.lora_unload_btn.grid(row=2, column=5, padx=2, pady=(6, 0), sticky="w")
+        self.lora_hf_btn.grid(row=2, column=6, padx=2, pady=(6, 0))
+        self.lora_civitai_btn.grid(row=2, column=7, padx=2, pady=(6, 0), sticky="w")
+        self.lora_status.grid(row=3, column=1, columnspan=7, padx=5, sticky="w")
+        self._sync_custom_row()
 
         content_frame = ttk.Frame(self.main_frame)
         content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -361,16 +395,30 @@ class ImageEditorClient:
         """Rebuild the dropdown labels from the fixed list, marking cached ones.
 
         ✅ = already downloaded on the server, ⬇ = will download on first load.
-        Works offline (before the server is reachable) using the fixed list.
+        The last entry is a "Custom model…" escape hatch. Works offline.
         """
         idx = self.model_combo.current()
         labels = []
         for label, model_id, _precision, _quant in MODEL_PRESETS:
             mark = "✅ " if model_id in self._cached_ids else "⬇ "
             labels.append(mark + label)
+        labels.append(CUSTOM_LABEL)
         self.model_combo["values"] = labels
         # Preserve the current selection, else default to the first (recommended).
         self.model_combo.current(idx if idx >= 0 else 0)
+
+    def _is_custom_selected(self) -> bool:
+        return self.model_combo.current() == len(MODEL_PRESETS)
+
+    def _sync_custom_row(self) -> None:
+        """Enable the custom repo/precision fields only in Custom mode."""
+        state = "normal" if self._is_custom_selected() else "disabled"
+        combo_state = "readonly" if self._is_custom_selected() else "disabled"
+        try:
+            self.custom_model_entry.config(state=state)
+            self.custom_precision_combo.config(state=combo_state)
+        except Exception:
+            pass
 
     def _fetch_models(self) -> None:
         """Fetch the server's cache to mark which fixed presets are downloaded."""
@@ -473,12 +521,22 @@ class ImageEditorClient:
         refresh()
 
     def load_model(self) -> None:
-        """POST /load for the selected preset, then poll /health until ready."""
-        preset = self._current_preset()
-        if preset is None:
-            messagebox.showwarning("No Model", "Pick a model from the list first.")
-            return
-        _label, model_id, precision, gguf_quant = preset
+        """POST /load for the selected preset (or custom repo), then poll /health."""
+        if self._is_custom_selected():
+            model_id = self.custom_model_var.get().strip()
+            if not model_id:
+                messagebox.showwarning("No Model", "Enter a custom model repo id first.")
+                return
+            precision = self.custom_precision_var.get()
+            gguf_quant = "Q6_K" if precision == "gguf" else ""
+            self._settings["custom_model"] = model_id
+            self._settings["custom_precision"] = precision
+        else:
+            preset = self._current_preset()
+            if preset is None:
+                messagebox.showwarning("No Model", "Pick a model from the list first.")
+                return
+            _label, model_id, precision, gguf_quant = preset
 
         lora = self.lora_var.get().strip()
         payload = {
@@ -629,6 +687,116 @@ class ImageEditorClient:
     def _lora_done(self, text: str) -> None:
         self.lora_status.config(text=text)
         self.lora_load_btn.config(state="normal")
+
+    # ------------------------------------------------------------------ #
+    # In-app search (Hugging Face / Civitai)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _hf_search(query: str, kind: str):
+        """Search Hugging Face models. Returns [(display, value)]. value = repo id."""
+        import requests as _rq
+        params = {"search": query, "limit": 40, "sort": "downloads", "direction": -1}
+        r = _rq.get("https://huggingface.co/api/models", params=params, timeout=20)
+        r.raise_for_status()
+        out = []
+        for m in r.json():
+            rid = m.get("id", "")
+            if not rid:
+                continue
+            out.append((f"{rid}   (⬇{m.get('downloads', 0)}  ❤{m.get('likes', 0)})", rid))
+        return out
+
+    @staticmethod
+    def _civitai_search(query: str, kind: str):
+        """Search Civitai. Returns [(display, value)]. value = download URL."""
+        import requests as _rq
+        params = {"query": query, "limit": 30}
+        params["types"] = "LORA" if kind == "lora" else "Checkpoint"
+        r = _rq.get("https://civitai.com/api/v1/models", params=params, timeout=25)
+        r.raise_for_status()
+        out = []
+        for it in r.json().get("items", []):
+            versions = it.get("modelVersions", []) or []
+            url = ""
+            if versions:
+                files = versions[0].get("files", []) or []
+                if files:
+                    url = files[0].get("downloadUrl", "")
+            if not url:
+                continue
+            dl = it.get("stats", {}).get("downloadCount", 0)
+            out.append((f"{it.get('name', '?')}   (⬇{dl})", url))
+        return out
+
+    def _open_search(self, source: str, kind: str, target: str) -> None:
+        """Open a search window. source=hf|civitai, kind=model|lora, target=model|lora."""
+        title = f"🔍 Search {source.upper()} — {kind}s"
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("640x420")
+        win.transient(self.root)
+
+        bar = ttk.Frame(win)
+        bar.pack(fill=tk.X, padx=10, pady=8)
+        q_var = tk.StringVar(value="qwen image edit" if kind == "lora" else "qwen-image-edit")
+        entry = ttk.Entry(bar, textvariable=q_var, width=48)
+        entry.pack(side=tk.LEFT, padx=(0, 6))
+        listbox = tk.Listbox(win, width=95, height=16)
+        listbox.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
+        status = ttk.Label(win, text="", font=("Arial", 9))
+        status.pack(pady=2)
+        results: list = []  # parallel to listbox: (display, value)
+
+        def set_status(text):
+            if win.winfo_exists():
+                status.config(text=text)
+
+        def do_search():
+            q = q_var.get().strip()
+            if not q:
+                return
+            set_status("Searching…")
+            def worker():
+                try:
+                    fn = self._hf_search if source == "hf" else self._civitai_search
+                    items = fn(q, kind)
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    self.root.after(0, lambda: set_status(f"🔴 {msg}"))
+                    return
+                def apply():
+                    if not win.winfo_exists():
+                        return
+                    results.clear()
+                    listbox.delete(0, tk.END)
+                    for disp, val in items:
+                        results.append((disp, val))
+                        listbox.insert(tk.END, disp)
+                    set_status(f"{len(items)} result(s). Double-click or Use to select.")
+                self.root.after(0, apply)
+            threading.Thread(target=worker, daemon=True).start()
+
+        def use_selected(_event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            value = results[sel[0]][1]
+            if target == "model":
+                # Switch the dropdown to Custom and fill the repo field.
+                self.model_combo.current(len(MODEL_PRESETS))
+                self.custom_model_var.set(value)
+                self._sync_custom_row()
+                self.model_status.config(text=f"Custom model set: {value}")
+            else:  # lora
+                self.lora_var.set(value)
+                self.lora_status.config(text=f"LoRA field set: {_truncate(value, 50)}")
+            win.destroy()
+
+        ttk.Button(bar, text="Search", command=do_search).pack(side=tk.LEFT)
+        ttk.Button(bar, text="✅ Use", command=use_selected).pack(side=tk.RIGHT)
+        entry.bind("<Return>", lambda e: do_search())
+        listbox.bind("<Double-Button-1>", use_selected)
+        do_search()
 
     # ------------------------------------------------------------------ #
     # Settings persistence (remembered folders)
