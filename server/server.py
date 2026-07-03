@@ -163,6 +163,10 @@ class LoadRequest(BaseModel):
     gguf_file: str | None = None
     gguf_quant: str | None = None
     gguf_base: str | None = None
+    # Optional LoRA: HF repo id ("repo::weight.safetensors") or a direct URL
+    # (e.g. a Civitai download link). Empty = no LoRA.
+    lora_source: str | None = None
+    lora_scale: float | None = None
 
 
 @app.post("/load")
@@ -179,13 +183,15 @@ def load_model(req: LoadRequest, x_api_key: str | None = Header(default=None)) -
         gguf_file=req.gguf_file,
         gguf_quant=req.gguf_quant,
         gguf_base=req.gguf_base,
+        lora_source=req.lora_source,
+        lora_scale=req.lora_scale,
     )
     return JSONResponse(manager.state.as_dict())
 
 
 @app.post("/edit")
 async def edit(
-    image: UploadFile = File(..., description="Input image to edit."),
+    image: list[UploadFile] = File(..., description="Input image(s) — 1 to 3."),
     prompt: str = Form(..., description="Edit instruction."),
     num_inference_steps: int = Form(40),
     true_cfg_scale: float = Form(4.0),
@@ -206,15 +212,21 @@ async def edit(
             },
         )
 
+    # Accept 1-3 images sent under the repeated "image" field (image 1/2/3).
+    uploads = image if isinstance(image, list) else [image]
     try:
-        raw = await image.read()
-        pil_image = Image.open(io.BytesIO(raw))
+        pil_images = []
+        for up in uploads:
+            raw = await up.read()
+            pil_images.append(Image.open(io.BytesIO(raw)))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
+    if not pil_images:
+        raise HTTPException(status_code=400, detail="No image provided.")
 
     try:
         result = manager.edit(
-            pil_image,
+            pil_images,
             prompt=prompt,
             num_inference_steps=num_inference_steps,
             true_cfg_scale=true_cfg_scale,
@@ -236,11 +248,26 @@ def main() -> None:
 
     host = os.environ.get("QIE_HOST", "0.0.0.0")
     port = int(os.environ.get("QIE_PORT", "8000"))
-    print(f"🚀 Starting Qwen Image Edit API on http://{host}:{port}")
+
+    # Optional TLS: set QIE_SSL_CERT + QIE_SSL_KEY to encrypt the connection so
+    # traffic can't be intercepted. A self-signed cert is fine for personal use
+    # (generate with: openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem
+    #  -out cert.pem -days 365 -subj "/CN=<server-ip>").
+    ssl_cert = os.environ.get("QIE_SSL_CERT", "").strip()
+    ssl_key = os.environ.get("QIE_SSL_KEY", "").strip()
+    ssl_kwargs = {}
+    scheme = "http"
+    if ssl_cert and ssl_key:
+        ssl_kwargs = {"ssl_certfile": ssl_cert, "ssl_keyfile": ssl_key}
+        scheme = "https"
+
+    print(f"🚀 Starting Qwen Image Edit API on {scheme}://{host}:{port}")
     print(f"   Model: {DEFAULT_MODEL_ID}  |  Precision: {DEFAULT_PRECISION}")
     if API_KEY:
         print("   🔒 API key required (X-API-Key header).")
-    uvicorn.run(app, host=host, port=port)
+    if ssl_kwargs:
+        print("   🔐 TLS enabled (encrypted connection).")
+    uvicorn.run(app, host=host, port=port, **ssl_kwargs)
 
 
 if __name__ == "__main__":

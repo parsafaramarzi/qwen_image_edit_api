@@ -6,5 +6,9 @@
 requests>=2.31.0
 Pillow>=9.0.0
 
+# Optional: enables drag-and-drop of images onto the input slots.
+# The client works fine without it (just no drag-and-drop).
+tkinterdnd2>=0.4.0
+
 # tkinter ships with the standard CPython installer on Windows/macOS.
 # On Linux: sudo apt-get install python3-tk

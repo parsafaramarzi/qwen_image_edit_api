@@ -304,6 +304,60 @@ def _build_gguf_pipeline(model_id: str, repo: str, file: str, quant: str, base: 
     return pipeline, base_model
 
 
+# Directory where downloaded LoRA files are cached.
+LORA_CACHE_DIR = os.path.expanduser(os.environ.get("QIE_LORA_DIR", "~/.cache/qwen_loras"))
+
+
+def _download_lora(url: str) -> tuple:
+    """Download a LoRA file (e.g. from Civitai) to the local cache.
+
+    Returns (directory, filename) suitable for pipeline.load_lora_weights.
+    """
+    import re
+    import requests
+
+    os.makedirs(LORA_CACHE_DIR, exist_ok=True)
+
+    # A Civitai API token can be appended if the model requires auth.
+    token = os.environ.get("QIE_CIVITAI_TOKEN", "").strip()
+    if token and "civitai.com" in url and "token=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}token={token}"
+
+    with requests.get(url, stream=True, timeout=120, allow_redirects=True) as resp:
+        resp.raise_for_status()
+        # Prefer the server-provided filename; fall back to the URL tail.
+        name = None
+        cd = resp.headers.get("content-disposition", "")
+        m = re.search(r'filename="?([^"\r\n;]+)"?', cd)
+        if m:
+            name = m.group(1)
+        if not name:
+            name = url.split("?")[0].rstrip("/").split("/")[-1] or "lora.safetensors"
+        if not name.endswith((".safetensors", ".bin", ".pt")):
+            name += ".safetensors"
+
+        dest = os.path.join(LORA_CACHE_DIR, name)
+        if not os.path.exists(dest):  # simple cache: skip re-download
+            print(f"📥 Downloading LoRA → {dest}")
+            with open(dest, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    fh.write(chunk)
+    return LORA_CACHE_DIR, name
+
+
+def _resolve_lora(source: str) -> tuple:
+    """Return (path_or_repo, weight_name) for pipeline.load_lora_weights."""
+    source = source.strip()
+    if source.startswith("http://") or source.startswith("https://"):
+        return _download_lora(source)
+    # Otherwise treat as an HF repo id (optionally "repo::weight_name.safetensors").
+    if "::" in source:
+        repo, weight = source.split("::", 1)
+        return repo.strip(), weight.strip()
+    return source, None
+
+
 class ModelManager:
     """Owns the pipeline lifecycle and serialises inference calls.
 
@@ -328,6 +382,9 @@ class ModelManager:
         self._gguf_quant = DEFAULT_GGUF_QUANT
         self._gguf_file = DEFAULT_GGUF_FILE
         self._gguf_base = os.environ.get("QIE_GGUF_BASE", "")
+        # Optional LoRA (URL/repo + strength), applied after the base model.
+        self._lora_source = os.environ.get("QIE_LORA", "").strip()
+        self._lora_scale = float(os.environ.get("QIE_LORA_SCALE", "1.0"))
         # Live inference progress (polled by the client via /progress).
         self._progress = {"active": False, "stage": "idle", "step": 0, "total": 0}
         # Only one inference at a time — the model is a single shared GPU resource.
@@ -360,6 +417,8 @@ class ModelManager:
         gguf_file: Optional[str] = None,
         gguf_quant: Optional[str] = None,
         gguf_base: Optional[str] = None,
+        lora_source: Optional[str] = None,
+        lora_scale: Optional[float] = None,
     ) -> None:
         """Switch to a different model/precision. Runs in the background;
         poll the state (via /health) until status is 'ready' or 'error'."""
@@ -371,6 +430,8 @@ class ModelManager:
                 self._gguf_quant = (gguf_quant or DEFAULT_GGUF_QUANT).strip()
                 self._gguf_file = (gguf_file or "").strip()
                 self._gguf_base = (gguf_base or "").strip()
+                self._lora_source = (lora_source or "").strip()
+                self._lora_scale = float(lora_scale) if lora_scale is not None else 1.0
                 self.state = LoadState(
                     model_id=model_id.strip(),
                     precision=(precision or DEFAULT_PRECISION).strip().lower(),
@@ -413,6 +474,10 @@ class ModelManager:
             )
 
             pipeline = self._construct_pipeline()
+
+            # Apply an optional LoRA before offload hooks are attached.
+            lora_note = self._apply_lora(pipeline)
+
             self._apply_offload(pipeline, device)
 
             # Optional VAE memory savers (harmless, help on tight VRAM).
@@ -433,7 +498,7 @@ class ModelManager:
             self.state.ready_at = time.time()
             self.state.message = (
                 f"Ready on {device} ({self.state.precision}), "
-                f"loaded in {self.state.as_dict()['load_seconds']}s."
+                f"loaded in {self.state.as_dict()['load_seconds']}s.{lora_note}"
             )
             print(f"✅ {self.state.message}")
 
@@ -495,6 +560,30 @@ class ModelManager:
             load_kwargs["quantization_config"] = quant_config
         return AutoPipelineForImage2Image.from_pretrained(model_id, **load_kwargs)
 
+    def _apply_lora(self, pipeline) -> str:
+        """Load an optional LoRA onto the pipeline. Returns a status suffix.
+
+        A failure here does NOT fail the whole load — the base model still
+        works; we just note that the LoRA couldn't be applied (common on GGUF).
+        """
+        if not self._lora_source:
+            return ""
+        try:
+            path, weight_name = _resolve_lora(self._lora_source)
+            kwargs = {"adapter_name": "custom"}
+            if weight_name:
+                kwargs["weight_name"] = weight_name
+            print(f"🎨 Loading LoRA: {self._lora_source} (scale {self._lora_scale})")
+            pipeline.load_lora_weights(path, **kwargs)
+            try:
+                pipeline.set_adapters("custom", self._lora_scale)
+            except Exception:
+                pass  # some versions apply at load; scale then defaults to 1.0
+            return f" + LoRA (scale {self._lora_scale})"
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️  LoRA not applied: {exc}")
+            return f" [LoRA FAILED: {exc}]"
+
     def _apply_offload(self, pipeline, device: str) -> None:
         if device == "cuda":
             if self.state.precision in ("bf16", "max"):
@@ -518,7 +607,7 @@ class ModelManager:
     # ------------------------------------------------------------------ #
     def edit(
         self,
-        image: Image.Image,
+        images,
         prompt: str,
         *,
         num_inference_steps: int = 40,
@@ -529,8 +618,10 @@ class ModelManager:
     ) -> Image.Image:
         """Run one image edit. Blocks if another edit is in progress.
 
-        Optional parameters are filtered to what the loaded pipeline actually
-        accepts, so this works across Qwen, FLUX Kontext, SD img2img, etc.
+        ``images`` may be a single PIL image or a list (the Plus pipeline
+        supports up to ~3 reference images; refer to them as "image 1/2/3" in
+        the prompt). Optional parameters are filtered to what the loaded
+        pipeline accepts, so this also works across FLUX Kontext, SD img2img, etc.
         """
         if not self.is_ready:
             raise RuntimeError(
@@ -538,14 +629,17 @@ class ModelManager:
                 f"{self.state.message}"
             )
 
-        image = image.convert("RGB")
+        if isinstance(images, Image.Image):
+            images = [images]
+        images = [im.convert("RGB") for im in images]
         gen_device = "cuda" if self.state.device == "cuda" else "cpu"
         steps = int(num_inference_steps)
 
         # Always-present inputs.
         inputs = {
-            # The Plus (2509/2511) pipeline expects a list of images.
-            "image": [image] if self._is_plus else image,
+            # The Plus (2509/2511) pipeline takes a list; classic ones a single
+            # image, so hand non-Plus pipelines just the first image.
+            "image": images if self._is_plus else images[0],
             "prompt": prompt,
             "generator": torch.Generator(device=gen_device).manual_seed(int(seed)),
         }

@@ -14,6 +14,7 @@ Configure the server URL via:
 
 import base64
 import io
+import json
 import os
 import threading
 import traceback
@@ -30,9 +31,30 @@ except ImportError:
     print("❌ 'requests' not installed. Run: pip install -r requirements.txt")
     raise SystemExit(1)
 
+# Optional drag-and-drop support (pip install tkinterdnd2). Degrades gracefully.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+
 
 DEFAULT_SERVER_URL = os.environ.get("QIE_SERVER_URL", "http://193.93.169.217:8000")
 DEFAULT_API_KEY = os.environ.get("QIE_API_KEY", "")
+
+# For self-signed TLS, set QIE_SSL_VERIFY=0 so the client accepts the cert
+# (traffic is still encrypted; it just skips cert-authority validation).
+SSL_VERIFY = os.environ.get("QIE_SSL_VERIFY", "1").lower() not in ("0", "false", "no")
+if not SSL_VERIFY:
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+# Remembers last-used folders across runs.
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".qwen_image_client.json")
+MAX_IMAGES = 3
 
 # Fixed, curated model list. Each entry is (label, model_id, precision, gguf_quant).
 # Keeping this closed avoids users typing bad repo ids or unsupported quants.
@@ -57,15 +79,23 @@ class ImageEditorClient:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Qwen Image Editor (Client) v1.0")
-        self.root.geometry("1200x680")
-        self.root.minsize(900, 560)
+        self.root.title("Qwen Image Editor (Client) v1.1")
+        self.root.geometry("1250x720")
+        self.root.minsize(980, 600)
 
-        self.input_image: Optional[Image.Image] = None
+        # Up to MAX_IMAGES input slots (image 1 is the main/target).
+        self.input_images: list = [None] * MAX_IMAGES
+        self.input_paths: list = [""] * MAX_IMAGES
         self.output_image: Optional[Image.Image] = None
-        self.input_image_path: str = ""
         self.is_processing: bool = False
         self._poll_progress: bool = False
+
+        # HTTP session honoring the TLS verify setting.
+        self.session = requests.Session()
+        self.session.verify = SSL_VERIFY
+
+        # Persisted settings (last-used folders).
+        self._settings = self._load_settings()
 
         self.create_widgets()
         self.setup_layout()
@@ -110,11 +140,48 @@ class ImageEditorClient:
         self._cached_ids: set = set()
         self._refresh_model_choices()  # populate from the fixed list (works offline)
 
-        # Input
-        self.input_frame = ttk.LabelFrame(self.main_frame, text="📥 Input Image", padding="5")
-        self.input_canvas = tk.Canvas(self.input_frame, width=300, height=300, bg="#f0f0f0")
-        self.input_label = ttk.Label(self.input_frame, text="No image selected")
-        self.browse_btn = ttk.Button(self.input_frame, text="📂 Browse Image", command=self.browse_image)
+        # LoRA row (optional): a Hugging Face repo id ("repo::file.safetensors")
+        # or a direct URL (e.g. a Civitai download link) + a strength.
+        ttk.Label(self.model_frame, text="LoRA (URL/repo, optional):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.lora_var = tk.StringVar(value=self._settings.get("lora", ""))
+        self.lora_entry = ttk.Entry(self.model_frame, textvariable=self.lora_var, width=52)
+        ttk.Label(self.model_frame, text="Strength:").grid(row=1, column=2, sticky="e", pady=(6, 0))
+        self.lora_scale_var = tk.DoubleVar(value=float(self._settings.get("lora_scale", 1.0)))
+        self.lora_scale_spin = ttk.Spinbox(
+            self.model_frame, from_=0.0, to=2.0, increment=0.05,
+            textvariable=self.lora_scale_var, width=6,
+        )
+
+        # Input images (up to MAX_IMAGES). Slot 0 is the main/target image.
+        self.input_frame = ttk.LabelFrame(
+            self.main_frame, text="📥 Input Images (1–3)", padding="5"
+        )
+        self.input_canvases: list = []
+        self.input_slot_labels: list = []
+        for i in range(MAX_IMAGES):
+            slot = ttk.Frame(self.input_frame)
+            slot.pack(pady=3, fill=tk.X)
+            role = "main" if i == 0 else "optional"
+            cv = tk.Canvas(slot, width=250, height=118, bg="#f0f0f0", highlightthickness=1,
+                           highlightbackground="#cccccc")
+            cv.grid(row=0, column=0, rowspan=2, padx=(0, 6))
+            lbl = ttk.Label(slot, text=f"Image {i + 1} ({role})", font=("Arial", 9))
+            lbl.grid(row=0, column=1, sticky="sw")
+            btns = ttk.Frame(slot)
+            btns.grid(row=1, column=1, sticky="nw")
+            ttk.Button(btns, text="📂 Browse", width=9,
+                       command=lambda idx=i: self.browse_image(idx)).pack(side=tk.LEFT)
+            ttk.Button(btns, text="✖", width=3,
+                       command=lambda idx=i: self.clear_image(idx)).pack(side=tk.LEFT, padx=3)
+            self.input_canvases.append(cv)
+            self.input_slot_labels.append(lbl)
+            self._register_drop_target(cv, i)
+        dnd_hint = "  (tip: drag & drop images onto a slot)" if _DND_AVAILABLE else ""
+        self.input_hint = ttk.Label(
+            self.input_frame,
+            text=("Refer to them as \"image 1/2/3\" in your prompt." + dnd_hint),
+            font=("Arial", 8), foreground="#666666", wraplength=270, justify="left",
+        )
 
         # Controls
         self.controls_frame = ttk.LabelFrame(self.main_frame, text="⚙️ Edit Controls", padding="5")
@@ -165,14 +232,14 @@ class ImageEditorClient:
         self.load_model_btn.grid(row=0, column=2, padx=5)
         self.downloads_btn.grid(row=0, column=3, padx=2)
         self.model_status.grid(row=0, column=4, padx=10, sticky="w")
+        self.lora_entry.grid(row=1, column=1, padx=5, pady=(6, 0), sticky="w")
+        self.lora_scale_spin.grid(row=1, column=3, padx=5, pady=(6, 0), sticky="w")
 
         content_frame = ttk.Frame(self.main_frame)
         content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
         self.input_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        self.input_canvas.pack(pady=5)
-        self.input_label.pack(pady=2)
-        self.browse_btn.pack(pady=5)
+        self.input_hint.pack(pady=(4, 0))
 
         self.controls_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5)
         ttk.Label(self.controls_frame, text="✏️ Edit Prompt:").pack(pady=(0, 5))
@@ -206,7 +273,7 @@ class ImageEditorClient:
         def worker():
             url = f"{self.base_url()}/health"
             try:
-                resp = requests.get(url, headers=self.auth_headers(), timeout=10)
+                resp = self.session.get(url, headers=self.auth_headers(), timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
                 status = data.get("status")
@@ -260,7 +327,7 @@ class ImageEditorClient:
         """Fetch the server's cache to mark which fixed presets are downloaded."""
         def worker():
             try:
-                resp = requests.get(
+                resp = self.session.get(
                     f"{self.base_url()}/cache", headers=self.auth_headers(), timeout=10
                 )
                 resp.raise_for_status()
@@ -299,7 +366,7 @@ class ImageEditorClient:
             set_status("Loading…")
             def worker():
                 try:
-                    resp = requests.get(
+                    resp = self.session.get(
                         f"{self.base_url()}/cache", headers=self.auth_headers(), timeout=15
                     )
                     resp.raise_for_status()
@@ -335,7 +402,7 @@ class ImageEditorClient:
             set_status(f"Deleting {repo_id}…")
             def worker():
                 try:
-                    resp = requests.post(
+                    resp = self.session.post(
                         f"{self.base_url()}/cache/delete", json={"repo_id": repo_id},
                         headers=self.auth_headers(), timeout=60,
                     )
@@ -364,17 +431,25 @@ class ImageEditorClient:
             return
         _label, model_id, precision, gguf_quant = preset
 
+        lora = self.lora_var.get().strip()
         payload = {
             "model_id": model_id,
             "precision": precision,
             "gguf_quant": gguf_quant or None,
+            "lora_source": lora or None,
+            "lora_scale": self.lora_scale_var.get() if lora else None,
         }
+        # Remember the LoRA choice for next launch.
+        self._settings["lora"] = lora
+        self._settings["lora_scale"] = self.lora_scale_var.get()
+        self._save_settings()
+
         self.load_model_btn.config(state="disabled")
         self.model_status.config(text="⏳ Requesting load…")
 
         def worker():
             try:
-                resp = requests.post(
+                resp = self.session.post(
                     f"{self.base_url()}/load", json=payload,
                     headers=self.auth_headers(), timeout=30,
                 )
@@ -389,7 +464,7 @@ class ImageEditorClient:
             deadline = _t.time() + 3600
             while _t.time() < deadline:
                 try:
-                    h = requests.get(
+                    h = self.session.get(
                         f"{self.base_url()}/health", headers=self.auth_headers(), timeout=10
                     ).json()
                 except Exception:
@@ -417,38 +492,91 @@ class ImageEditorClient:
         self.load_model_btn.config(state="normal")
 
     # ------------------------------------------------------------------ #
+    # Settings persistence (remembered folders)
+    # ------------------------------------------------------------------ #
+    def _load_settings(self) -> dict:
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+
+    def _save_settings(self) -> None:
+        try:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as fh:
+                json.dump(self._settings, fh)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Drag & drop (optional; needs tkinterdnd2)
+    # ------------------------------------------------------------------ #
+    def _register_drop_target(self, canvas: tk.Canvas, idx: int) -> None:
+        if not _DND_AVAILABLE:
+            return
+        try:
+            canvas.drop_target_register(DND_FILES)
+            canvas.dnd_bind("<<Drop>>", lambda e, i=idx: self._on_drop(e, i))
+        except Exception:
+            pass
+
+    def _on_drop(self, event, idx: int) -> None:
+        # event.data may be "{C:/path with spaces.png}" or multiple paths.
+        data = event.data.strip()
+        path = None
+        if data.startswith("{"):
+            path = data[1:data.index("}")] if "}" in data else data.strip("{}")
+        else:
+            path = data.split()[0] if data else None
+        if path:
+            self.load_image(path, idx)
+
+    # ------------------------------------------------------------------ #
     # Image loading / display
     # ------------------------------------------------------------------ #
-    def browse_image(self) -> None:
+    def browse_image(self, idx: int = 0) -> None:
         filetypes = (
             ("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff *.webp *.gif"),
             ("All files", "*.*"),
         )
         filename = filedialog.askopenfilename(
-            title="Select an image to edit", initialdir=os.getcwd(), filetypes=filetypes
+            title=f"Select image {idx + 1}",
+            initialdir=self._settings.get("input_dir", os.getcwd()),
+            filetypes=filetypes,
         )
         if filename:
-            self.load_image(filename)
+            self.load_image(filename, idx)
 
-    def load_image(self, filepath: str) -> None:
+    def load_image(self, filepath: str, idx: int = 0) -> None:
         try:
-            self.input_image = Image.open(filepath).convert("RGB")
-            self.input_image_path = filepath
-            self._show_on_canvas(self.input_canvas, self.input_image)
-            w, h = self.input_image.size
-            self.input_label.config(text=f"📄 {os.path.basename(filepath)}\n📐 {w}×{h} pixels")
+            img = Image.open(filepath).convert("RGB")
+            self.input_images[idx] = img
+            self.input_paths[idx] = filepath
+            self._show_on_canvas(self.input_canvases[idx], img, size=(250, 118))
+            w, h = img.size
+            role = "main" if idx == 0 else "optional"
+            self.input_slot_labels[idx].config(
+                text=f"Image {idx + 1} ({role}) · {os.path.basename(filepath)} · {w}×{h}"
+            )
+            self._settings["input_dir"] = os.path.dirname(filepath)
+            self._save_settings()
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Image Loading Error", f"Failed to load image:\n{exc}")
-            self.input_image = None
-            self.input_image_path = ""
 
-    def _show_on_canvas(self, canvas: tk.Canvas, image: Image.Image) -> None:
-        display = self._resize_for_display(image, 300, 300)
+    def clear_image(self, idx: int) -> None:
+        self.input_images[idx] = None
+        self.input_paths[idx] = ""
+        self.input_canvases[idx].delete("all")
+        role = "main" if idx == 0 else "optional"
+        self.input_slot_labels[idx].config(text=f"Image {idx + 1} ({role})")
+
+    def _show_on_canvas(self, canvas: tk.Canvas, image: Image.Image, size=(300, 300)) -> None:
+        display = self._resize_for_display(image, size[0], size[1])
         buffer = io.BytesIO()
         display.save(buffer, format="PNG")
         photo = tk.PhotoImage(data=base64.b64encode(buffer.getvalue()))
         canvas.delete("all")
-        canvas.create_image(150, 150, image=photo)
+        canvas.create_image(size[0] // 2, size[1] // 2, image=photo)
         canvas.image = photo  # keep a reference
 
     @staticmethod
@@ -467,8 +595,9 @@ class ImageEditorClient:
     # Edit (calls the API)
     # ------------------------------------------------------------------ #
     def edit_image(self) -> None:
-        if self.input_image is None:
-            messagebox.showwarning("No Input Image", "Please select an input image first.")
+        images = [im for im in self.input_images if im is not None]
+        if not images:
+            messagebox.showwarning("No Input Image", "Please select at least one input image.")
             return
         prompt = self.prompt_text.get("1.0", tk.END).strip()
         if not prompt:
@@ -479,11 +608,11 @@ class ImageEditorClient:
 
         self.is_processing = True
         self.edit_btn.config(state="disabled")
-        self.browse_btn.config(state="disabled")
         self.save_btn.config(state="disabled")
         self.progress_bar.config(mode="indeterminate")
         self.progress_bar.start()
-        self.status_label.config(text="📤 Uploading image to server…")
+        n = len(images)
+        self.status_label.config(text=f"📤 Uploading {n} image{'s' if n > 1 else ''} to server…")
 
         params = {
             "prompt": prompt,
@@ -503,7 +632,7 @@ class ImageEditorClient:
         import time as _t
         while self._poll_progress:
             try:
-                data = requests.get(
+                data = self.session.get(
                     f"{self.base_url()}/progress", headers=self.auth_headers(), timeout=5
                 ).json()
             except Exception:
@@ -533,12 +662,16 @@ class ImageEditorClient:
 
     def _request_edit(self, params: dict) -> None:
         try:
-            buffer = io.BytesIO()
-            self.input_image.save(buffer, format="PNG")
-            buffer.seek(0)
-            files = {"image": ("input.png", buffer, "image/png")}
+            # Send every filled slot under the repeated "image" field (in order,
+            # so the server sees image 1, 2, 3 as referenced in the prompt).
+            files = []
+            for i, img in enumerate(im for im in self.input_images if im is not None):
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                buf.seek(0)
+                files.append(("image", (f"image{i + 1}.png", buf, "image/png")))
 
-            resp = requests.post(
+            resp = self.session.post(
                 f"{self.base_url()}/edit",
                 data=params,
                 files=files,
@@ -574,7 +707,6 @@ class ImageEditorClient:
         self.output_label.config(text=f"✨ Edited Image\n📐 {w}×{h} pixels")
         self.status_label.config(text="✅ Done.")
         self.edit_btn.config(state="normal")
-        self.browse_btn.config(state="normal")
         self.save_btn.config(state="normal")
 
     def _edit_error(self, msg: str) -> None:
@@ -582,7 +714,6 @@ class ImageEditorClient:
         self._reset_progress_bar()
         self.status_label.config(text="❌ Failed.")
         self.edit_btn.config(state="normal")
-        self.browse_btn.config(state="normal")
         messagebox.showerror("Edit Failed", f"Could not edit image:\n\n{msg}")
 
     # ------------------------------------------------------------------ #
@@ -592,13 +723,15 @@ class ImageEditorClient:
         if self.output_image is None:
             messagebox.showwarning("No Output", "No edited image to save.")
             return
+        main_path = self.input_paths[0]
         base = (
-            os.path.splitext(os.path.basename(self.input_image_path))[0]
-            if self.input_image_path
+            os.path.splitext(os.path.basename(main_path))[0]
+            if main_path
             else "edited_image"
         )
         filename = filedialog.asksaveasfilename(
             title="Save edited image",
+            initialdir=self._settings.get("output_dir", self._settings.get("input_dir", os.getcwd())),
             initialfile=f"{base}_edited.png",
             defaultextension=".png",
             filetypes=(("PNG files", "*.png"), ("JPEG files", "*.jpg *.jpeg"), ("All files", "*.*")),
@@ -606,6 +739,8 @@ class ImageEditorClient:
         if filename:
             try:
                 self.output_image.save(filename)
+                self._settings["output_dir"] = os.path.dirname(filename)
+                self._save_settings()
                 messagebox.showinfo("Saved", f"✅ Saved to:\n{os.path.abspath(filename)}")
             except Exception as exc:  # noqa: BLE001
                 messagebox.showerror("Save Error", f"Failed to save image:\n{exc}")
@@ -619,7 +754,8 @@ class ImageEditorClient:
 
 
 def main() -> None:
-    root = tk.Tk()
+    # Use the DnD-capable root if tkinterdnd2 is installed, else plain Tk.
+    root = TkinterDnD.Tk() if _DND_AVAILABLE else tk.Tk()
     root.resizable(True, True)
     ImageEditorClient(root)
     root.update_idletasks()
