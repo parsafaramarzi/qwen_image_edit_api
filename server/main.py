@@ -44,7 +44,7 @@ def main() -> None:
 
     print(f"🎨 Editing '{input_path}' with prompt: {prompt!r}")
     image = Image.open(input_path)
-    result = manager.edit(image, prompt)
+    result = manager.run([image], prompt)
     result.save(output_path)
     print(f"✅ Saved to: {os.path.abspath(output_path)}")
 

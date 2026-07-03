@@ -1,0 +1,7 @@
+# ─────────────────────────────────────────────────────────────
+# Qwen Image Studio — WEB CHAT client (your personal PC)
+# No torch / diffusers / GPU needed — talks to the server over HTTP.
+# ─────────────────────────────────────────────────────────────
+streamlit>=1.36.0
+requests>=2.31.0
+Pillow>=9.0.0

@@ -112,6 +112,7 @@ def _check_api_key(provided: str | None) -> None:
 def health() -> JSONResponse:
     data = manager.state.as_dict()
     data["lora"] = manager.lora_info()
+    data["task"] = manager.task_info()
     return JSONResponse(data)
 
 
@@ -230,14 +231,17 @@ def load_model(req: LoadRequest, x_api_key: str | None = Header(default=None)) -
 
 
 @app.post("/edit")
+@app.post("/generate")
 async def edit(
-    image: list[UploadFile] = File(..., description="Input image(s) — 1 to 3."),
-    prompt: str = Form(..., description="Edit instruction."),
+    image: list[UploadFile] | None = File(None, description="Input image(s) — 0 to 3."),
+    prompt: str = Form(..., description="Prompt / edit instruction."),
     num_inference_steps: int = Form(40),
     true_cfg_scale: float = Form(4.0),
     negative_prompt: str = Form(""),
     seed: int = Form(0),
     guidance_scale: float = Form(1.0),
+    width: int = Form(0),
+    height: int = Form(0),
     x_api_key: str | None = Header(default=None),
 ):
     _check_api_key(x_api_key)
@@ -252,20 +256,21 @@ async def edit(
             },
         )
 
-    # Accept 1-3 images sent under the repeated "image" field (image 1/2/3).
-    uploads = image if isinstance(image, list) else [image]
+    # 0-3 images under the repeated "image" field. None/empty ⇒ generation.
+    uploads = image or []
+    if not isinstance(uploads, list):
+        uploads = [uploads]
     try:
         pil_images = []
         for up in uploads:
             raw = await up.read()
-            pil_images.append(Image.open(io.BytesIO(raw)))
+            if raw:
+                pil_images.append(Image.open(io.BytesIO(raw)))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
-    if not pil_images:
-        raise HTTPException(status_code=400, detail="No image provided.")
 
     try:
-        result = manager.edit(
+        result = manager.run(
             pil_images,
             prompt=prompt,
             num_inference_steps=num_inference_steps,
@@ -273,6 +278,8 @@ async def edit(
             negative_prompt=negative_prompt,
             seed=seed,
             guidance_scale=guidance_scale,
+            width=width or None,
+            height=height or None,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Inference failed: {exc}")

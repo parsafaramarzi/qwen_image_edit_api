@@ -70,11 +70,16 @@ except ImportError:  # pragma: no cover - older diffusers
     QwenImageEditPlusPipeline = None
 
 # For non-Qwen models (FLUX Kontext, SD/SDXL img2img, InstructPix2Pix, ...) we
-# let diffusers auto-detect the right image-to-image pipeline class.
+# let diffusers auto-detect the right pipeline class — image-to-image for
+# editing models, text-to-image for pure generation models.
 try:
     from diffusers import AutoPipelineForImage2Image
 except ImportError:  # pragma: no cover - older diffusers
     AutoPipelineForImage2Image = None
+try:
+    from diffusers import AutoPipelineForText2Image
+except ImportError:  # pragma: no cover - older diffusers
+    AutoPipelineForText2Image = None
 
 
 def _is_qwen_edit(model_id: str) -> bool:
@@ -375,6 +380,8 @@ class ModelManager:
         self._pipeline = None
         self._is_plus = False   # True for a Qwen 2509/2511 "Plus" pipeline
         self._is_qwen = _is_qwen_edit(model_id)
+        self._needs_image = True   # False for text-to-image (generation) models
+        self._task = "edit"        # "edit" (image→image) | "generate" (text→image)
         # Names accepted by the current pipeline's __call__ (None = accept all).
         self._call_params: Optional[set] = None
         # GGUF settings (overridable per-reload from the client).
@@ -404,6 +411,10 @@ class ModelManager:
             "source": self._lora_source,
             "scale": self._lora_scale,
         }
+
+    def task_info(self) -> dict:
+        """Whether the loaded model edits (needs an image) or generates."""
+        return {"task": self._task, "needs_image": self._needs_image}
 
     # ------------------------------------------------------------------ #
     # LoRA (apply/remove on the already-loaded model)
@@ -595,6 +606,8 @@ class ModelManager:
                 self._gguf_quant, self._gguf_base,
             )
             self._is_plus = _uses_plus_pipeline(base)
+            self._needs_image = True    # GGUF path is Qwen edit only
+            self._task = "edit"
             return pipeline
 
         load_kwargs = {
@@ -608,6 +621,8 @@ class ModelManager:
             if quant_config is not None:
                 load_kwargs["quantization_config"] = quant_config
             self._is_plus = _uses_plus_pipeline(model_id)
+            self._needs_image = True
+            self._task = "edit"
             if self._is_plus:
                 if QwenImageEditPlusPipeline is None:
                     raise RuntimeError(
@@ -619,18 +634,35 @@ class ModelManager:
                 pipeline_cls = QwenImageEditPipeline
             return pipeline_cls.from_pretrained(model_id, **load_kwargs)
 
-        # Any other model: auto-detect the image-to-image pipeline class.
+        # Any other model: prefer image-to-image (editing); if the model has no
+        # img2img variant it's a pure generation model, so fall back to
+        # text-to-image. This is what lets the server handle BOTH kinds.
         self._is_plus = False
-        if AutoPipelineForImage2Image is None:
-            raise RuntimeError(
-                "AutoPipelineForImage2Image is unavailable; upgrade diffusers."
-            )
         # Quantize all quantizable submodules (component names vary across
         # architectures — unet vs transformer — so don't restrict them).
         quant_config = _build_quant_config(precision, None)
         if quant_config is not None:
             load_kwargs["quantization_config"] = quant_config
-        return AutoPipelineForImage2Image.from_pretrained(model_id, **load_kwargs)
+
+        if AutoPipelineForImage2Image is not None:
+            try:
+                pipe = AutoPipelineForImage2Image.from_pretrained(model_id, **load_kwargs)
+                self._needs_image = True
+                self._task = "edit"
+                return pipe
+            except Exception as exc:  # noqa: BLE001
+                print(f"ℹ️  No image-to-image pipeline for {model_id} ({exc}); "
+                      "loading as text-to-image (generation).")
+
+        if AutoPipelineForText2Image is None:
+            raise RuntimeError(
+                "Neither image-to-image nor text-to-image auto-pipeline is "
+                "available; upgrade diffusers."
+            )
+        pipe = AutoPipelineForText2Image.from_pretrained(model_id, **load_kwargs)
+        self._needs_image = False
+        self._task = "generate"
+        return pipe
 
     def _apply_lora(self, pipeline) -> str:
         """Load an optional LoRA onto the pipeline. Returns a status suffix.
@@ -683,7 +715,7 @@ class ModelManager:
     # ------------------------------------------------------------------ #
     # Inference
     # ------------------------------------------------------------------ #
-    def edit(
+    def run(
         self,
         images,
         prompt: str,
@@ -693,13 +725,18 @@ class ModelManager:
         negative_prompt: str = "",
         seed: int = 0,
         guidance_scale: float = 1.0,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
     ) -> Image.Image:
-        """Run one image edit. Blocks if another edit is in progress.
+        """Run one edit or generation. Blocks if another job is in progress.
 
-        ``images`` may be a single PIL image or a list (the Plus pipeline
-        supports up to ~3 reference images; refer to them as "image 1/2/3" in
-        the prompt). Optional parameters are filtered to what the loaded
-        pipeline accepts, so this also works across FLUX Kontext, SD img2img, etc.
+        ``images`` may be empty (text-to-image generation), a single PIL image,
+        or a list (edit models; Plus supports ~3 reference images). Behaviour:
+          * An **edit** model with no image → clear error.
+          * A **generation** model with images → the images are ignored (no
+            crash), because the pipeline doesn't accept an ``image`` argument.
+        Every optional argument is filtered to what the pipeline actually
+        accepts, so this works across Qwen edit, FLUX, SD/SDXL, etc.
         """
         if not self.is_ready:
             raise RuntimeError(
@@ -707,20 +744,30 @@ class ModelManager:
                 f"{self.state.message}"
             )
 
+        if images is None:
+            images = []
         if isinstance(images, Image.Image):
             images = [images]
         images = [im.convert("RGB") for im in images]
+
+        if self._needs_image and not images:
+            raise RuntimeError(
+                "This model edits images and needs at least one input image."
+            )
+
         gen_device = "cuda" if self.state.device == "cuda" else "cpu"
         steps = int(num_inference_steps)
 
-        # Always-present inputs.
         inputs = {
-            # The Plus (2509/2511) pipeline takes a list; classic ones a single
-            # image, so hand non-Plus pipelines just the first image.
-            "image": images if self._is_plus else images[0],
             "prompt": prompt,
             "generator": torch.Generator(device=gen_device).manual_seed(int(seed)),
         }
+
+        # Add the image(s) only if the pipeline accepts an "image" arg. For a
+        # text-to-image model this key is absent, so any supplied image is
+        # silently dropped instead of crashing.
+        if images and (self._call_params is None or "image" in self._call_params):
+            inputs["image"] = images if self._is_plus else images[0]
 
         # Optional inputs — included only if the pipeline's __call__ accepts them.
         optional = {
@@ -728,6 +775,10 @@ class ModelManager:
             "guidance_scale": float(guidance_scale),
             "true_cfg_scale": float(true_cfg_scale),
         }
+        if width:
+            optional["width"] = int(width)
+        if height:
+            optional["height"] = int(height)
         # Qwen wants a single space for "no negative prompt"; others take "".
         if negative_prompt:
             optional["negative_prompt"] = negative_prompt
