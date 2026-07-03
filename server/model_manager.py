@@ -363,6 +363,94 @@ def _resolve_lora(source: str) -> tuple:
     return source, None
 
 
+# --------------------------------------------------------------------------- #
+# Single-file checkpoint loading (Civitai / direct .safetensors URLs)
+# --------------------------------------------------------------------------- #
+CHECKPOINT_CACHE_DIR = os.path.expanduser(
+    os.environ.get("QIE_CHECKPOINT_DIR", "~/.cache/qwen_checkpoints")
+)
+
+
+def _is_single_file(model_id: str) -> bool:
+    m = model_id.strip().lower()
+    return (
+        m.startswith("http://") or m.startswith("https://")
+        or m.endswith((".safetensors", ".ckpt"))
+    )
+
+
+def _download_checkpoint(url: str) -> str:
+    """Download a single-file checkpoint (e.g. from Civitai) to the cache."""
+    import re
+    import requests
+
+    os.makedirs(CHECKPOINT_CACHE_DIR, exist_ok=True)
+    token = os.environ.get("QIE_CIVITAI_TOKEN", "").strip()
+    if token and "civitai.com" in url and "token=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}token={token}"
+
+    with requests.get(url, stream=True, timeout=300, allow_redirects=True) as resp:
+        resp.raise_for_status()
+        name = None
+        m = re.search(r'filename="?([^"\r\n;]+)"?', resp.headers.get("content-disposition", ""))
+        if m:
+            name = m.group(1)
+        if not name:
+            name = url.split("?")[0].rstrip("/").split("/")[-1] or "model.safetensors"
+        if not name.endswith((".safetensors", ".ckpt")):
+            name += ".safetensors"
+        dest = os.path.join(CHECKPOINT_CACHE_DIR, name)
+        if not os.path.exists(dest):
+            print(f"📥 Downloading checkpoint → {dest}")
+            with open(dest, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    fh.write(chunk)
+    return dest
+
+
+def _load_single_file_pipeline(path: str, precision: str):
+    """Best-effort single-file load. Tries known diffusers pipeline classes
+    until one accepts the checkpoint. Returns (pipeline, needs_image, task).
+
+    NOTE: single-file support depends on the model's architecture being one
+    diffusers recognises (SD/SDXL/SD3/FLUX/Qwen-Image). Many Civitai checkpoints
+    are ComfyUI-format and may not load; the error lists what was tried.
+    """
+    import diffusers
+
+    quant = _build_quant_config(precision, None)
+    class_names = [
+        "StableDiffusionXLPipeline",
+        "FluxPipeline",
+        "StableDiffusion3Pipeline",
+        "QwenImagePipeline",
+        "StableDiffusionPipeline",
+    ]
+    errors = []
+    for name in class_names:
+        cls = getattr(diffusers, name, None)
+        if cls is None or not hasattr(cls, "from_single_file"):
+            continue
+        for use_quant in ([True, False] if quant is not None else [False]):
+            try:
+                kwargs = {"torch_dtype": torch.bfloat16}
+                if use_quant and quant is not None:
+                    kwargs["quantization_config"] = quant
+                print(f"🔧 Trying single-file load as {name}"
+                      f"{' (quantized)' if use_quant else ''} …")
+                pipe = cls.from_single_file(path, **kwargs)
+                print(f"✅ Loaded single-file checkpoint as {name}.")
+                return pipe, False, "generate"
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{name}{'+q' if use_quant else ''}: {str(exc)[:100]}")
+    raise RuntimeError(
+        "Could not load this single-file checkpoint with any supported pipeline "
+        "(SD/SDXL/SD3/FLUX/Qwen-Image). It may be a ComfyUI-only format. "
+        "Tried: " + " || ".join(errors[:4])
+    )
+
+
 class ModelManager:
     """Owns the pipeline lifecycle and serialises inference calls.
 
@@ -599,6 +687,18 @@ class ModelManager:
         """Build the right pipeline for the configured model + precision."""
         model_id = self.state.model_id
         precision = self.state.precision
+
+        # Single-file checkpoint (Civitai / direct .safetensors URL or path).
+        if _is_single_file(model_id):
+            path = model_id
+            if model_id.startswith(("http://", "https://")):
+                path = _download_checkpoint(model_id)
+            pipeline, needs_image, task = _load_single_file_pipeline(path, precision)
+            self._is_plus = False
+            self._is_qwen = False
+            self._needs_image = needs_image
+            self._task = task
+            return pipeline
 
         if precision == "gguf":
             pipeline, base = _build_gguf_pipeline(

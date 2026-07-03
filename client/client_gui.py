@@ -56,25 +56,15 @@ if not SSL_VERIFY:
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".qwen_image_client.json")
 MAX_IMAGES = 3
 
-# Fixed, curated model list. Each entry is (label, model_id, precision, gguf_quant).
-# Keeping this closed avoids users typing bad repo ids or unsupported quants.
-MODEL_PRESETS = [
-    ("Qwen Image Edit 2511 — GGUF Q6_K (recommended)",
-     "Qwen/Qwen-Image-Edit-2511", "gguf", "Q6_K"),
-    ("Qwen Image Edit 2511 — GGUF Q5_K_M (less VRAM)",
-     "Qwen/Qwen-Image-Edit-2511", "gguf", "Q5_K_M"),
-    ("Qwen Image Edit 2511 — GGUF Q8_0 (max quality, tight)",
-     "Qwen/Qwen-Image-Edit-2511", "gguf", "Q8_0"),
-    ("Qwen Image Edit 2511 — full bf16 (best, slow)",
-     "Qwen/Qwen-Image-Edit-2511", "max", ""),
-    ("Qwen Image Edit 2509 — 4-bit (fast)",
-     "Qwen/Qwen-Image-Edit-2509", "4bit", ""),
-    ("Qwen Image Edit (original) — 4-bit (fast)",
-     "Qwen/Qwen-Image-Edit", "4bit", ""),
+# Recommended quick-loads shown at the top of the dropdown (label, id, precision, quant).
+RECOMMENDED_MODELS = [
+    ("⚡ Qwen 2511 (GGUF Q6_K) — recommended", "Qwen/Qwen-Image-Edit-2511", "gguf", "Q6_K"),
+    ("Qwen 2511 (GGUF Q5_K_M, less VRAM)", "Qwen/Qwen-Image-Edit-2511", "gguf", "Q5_K_M"),
+    ("Qwen 2509 (4-bit)", "Qwen/Qwen-Image-Edit-2509", "4bit", ""),
 ]
 
 # Appended after the presets; selecting it enables the custom repo fields.
-CUSTOM_LABEL = "➕ Custom model (enter repo below)…"
+CUSTOM_LABEL = "➕ Custom model (HF repo or Civitai URL below)…"
 
 
 def _truncate(text: str, maxlen: int = 36) -> str:
@@ -182,16 +172,18 @@ class ImageEditorClient:
             command=lambda: self._open_search("hf", "model", "model"),
         )
         self.model_status = ttk.Label(self.model_frame, text="", font=("Arial", 9))
-        self._cached_ids: set = set()
+        self._cached_models: list = []
+        self._choice_map: list = []
 
         # Custom-model row (enabled only when "➕ Custom model…" is selected).
-        self.custom_lbl = ttk.Label(self.model_frame, text="Custom repo:")
+        self.custom_lbl = ttk.Label(self.model_frame, text="Custom repo/URL:")
         self.custom_model_var = tk.StringVar(value=self._settings.get("custom_model", ""))
         self.custom_model_entry = ttk.Entry(self.model_frame, textvariable=self.custom_model_var, width=40)
         self.custom_precision_var = tk.StringVar(value=self._settings.get("custom_precision", "4bit"))
+        # Only the quantizations WE apply on the fly (GGUF/single-file auto-detected).
         self.custom_precision_combo = ttk.Combobox(
             self.model_frame, textvariable=self.custom_precision_var, width=7, state="readonly",
-            values=["gguf", "4bit", "8bit", "bf16", "max"],
+            values=["4bit", "8bit", "bf16"],
         )
         self._refresh_model_choices()  # populate from the fixed list (works offline)
 
@@ -384,31 +376,41 @@ class ImageEditorClient:
     # ------------------------------------------------------------------ #
     # Model selection
     # ------------------------------------------------------------------ #
-    def _current_preset(self):
-        """Return the MODEL_PRESETS tuple for the current dropdown selection."""
+    def _current_choice(self) -> dict:
+        """Return the choice dict for the current dropdown selection."""
         idx = self.model_combo.current()
-        if 0 <= idx < len(MODEL_PRESETS):
-            return MODEL_PRESETS[idx]
-        return None
+        if 0 <= idx < len(self._choice_map):
+            return self._choice_map[idx]
+        return {"kind": "custom"}
 
     def _refresh_model_choices(self) -> None:
-        """Rebuild the dropdown labels from the fixed list, marking cached ones.
-
-        ✅ = already downloaded on the server, ⬇ = will download on first load.
-        The last entry is a "Custom model…" escape hatch. Works offline.
-        """
+        """Rebuild the dropdown: Recommended quick-loads + models CACHED on the
+        server + a Custom entry (HF repo / Civitai URL)."""
         idx = self.model_combo.current()
-        labels = []
-        for label, model_id, _precision, _quant in MODEL_PRESETS:
-            mark = "✅ " if model_id in self._cached_ids else "⬇ "
-            labels.append(mark + label)
-        labels.append(CUSTOM_LABEL)
-        self.model_combo["values"] = labels
-        # Preserve the current selection, else default to the first (recommended).
-        self.model_combo.current(idx if idx >= 0 else 0)
+        values = []
+        self._choice_map = []
+        for label, model_id, precision, quant in RECOMMENDED_MODELS:
+            values.append(label)
+            self._choice_map.append(
+                {"kind": "preset", "model_id": model_id, "precision": precision, "quant": quant}
+            )
+        for c in self._cached_models:
+            rid = c.get("repo_id", "")
+            values.append(f"📁 {rid}  ({c.get('size_str', '')})")
+            prec = "gguf" if "gguf" in rid.lower() else "4bit"
+            self._choice_map.append(
+                {"kind": "cached", "model_id": rid, "precision": prec,
+                 "quant": "Q6_K" if prec == "gguf" else ""}
+            )
+        values.append(CUSTOM_LABEL)
+        self._choice_map.append({"kind": "custom"})
+
+        self.model_combo["values"] = values
+        self.model_combo.current(idx if 0 <= idx < len(values) else 0)
+        self._sync_custom_row()
 
     def _is_custom_selected(self) -> bool:
-        return self.model_combo.current() == len(MODEL_PRESETS)
+        return self._current_choice().get("kind") == "custom"
 
     def _sync_custom_row(self) -> None:
         """Enable the custom repo/precision fields only in Custom mode."""
@@ -421,22 +423,22 @@ class ImageEditorClient:
             pass
 
     def _fetch_models(self) -> None:
-        """Fetch the server's cache to mark which fixed presets are downloaded."""
+        """Fetch the server's cached model list to populate the dropdown."""
         def worker():
             try:
                 resp = self.session.get(
                     f"{self.base_url()}/cache", headers=self.auth_headers(), timeout=10
                 )
                 resp.raise_for_status()
-                cached = {m["repo_id"] for m in resp.json().get("models", [])}
+                models = resp.json().get("models", [])
             except Exception:
-                return  # offline — keep the plain fixed list
-            self.root.after(0, lambda: self._set_cached(cached))
+                return  # offline — keep Recommended + Custom only
+            self.root.after(0, lambda: self._set_cached(models))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _set_cached(self, cached: set) -> None:
-        self._cached_ids = cached
+    def _set_cached(self, models: list) -> None:
+        self._cached_models = models
         self._refresh_model_choices()
 
     def open_downloads(self) -> None:
@@ -521,22 +523,31 @@ class ImageEditorClient:
         refresh()
 
     def load_model(self) -> None:
-        """POST /load for the selected preset (or custom repo), then poll /health."""
-        if self._is_custom_selected():
+        """POST /load for the selection (preset, cached, or custom repo/URL)."""
+        choice = self._current_choice()
+        if choice.get("kind") == "custom":
             model_id = self.custom_model_var.get().strip()
             if not model_id:
-                messagebox.showwarning("No Model", "Enter a custom model repo id first.")
+                messagebox.showwarning("No Model", "Enter an HF repo id or a Civitai URL first.")
                 return
-            precision = self.custom_precision_var.get()
-            gguf_quant = "Q6_K" if precision == "gguf" else ""
+            precision = self.custom_precision_var.get()   # 4bit/8bit/bf16
+            ml = model_id.lower()
+            # Auto-pick the right load path from the id/URL.
+            if "gguf" in ml:
+                precision, gguf_quant = "gguf", "Q6_K"
+            else:
+                # http(s)/.safetensors → server loads as a single-file checkpoint;
+                # precision is still used for on-the-fly quantization.
+                gguf_quant = ""
             self._settings["custom_model"] = model_id
             self._settings["custom_precision"] = precision
         else:
-            preset = self._current_preset()
-            if preset is None:
+            model_id = choice.get("model_id", "")
+            precision = choice.get("precision", "4bit")
+            gguf_quant = choice.get("quant", "")
+            if not model_id:
                 messagebox.showwarning("No Model", "Pick a model from the list first.")
                 return
-            _label, model_id, precision, gguf_quant = preset
 
         lora = self.lora_var.get().strip()
         payload = {
@@ -790,8 +801,9 @@ class ImageEditorClient:
                 return
             value = results[sel[0]][1]
             if target == "model":
-                # Switch the dropdown to Custom and fill the repo field.
-                self.model_combo.current(len(MODEL_PRESETS))
+                # Switch the dropdown to the Custom entry (last) and fill the field.
+                if self._choice_map:
+                    self.model_combo.current(len(self._choice_map) - 1)
                 self.custom_model_var.set(value)
                 self._sync_custom_row()
                 self.model_status.config(text=f"Custom model set: {value}")
