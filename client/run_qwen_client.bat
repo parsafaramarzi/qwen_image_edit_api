@@ -1,3 +1,4 @@
 @echo off
-python run_client.py
+cd /d "%~dp0"
+"..\.venv\Scripts\python.exe" run_client.py
 pause
