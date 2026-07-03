@@ -91,6 +91,23 @@ def _png_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
+def fetch_cached() -> list:
+    """Models already downloaded on the server: [{repo_id, size_str, size}]."""
+    try:
+        return api_get("/cache").json().get("models", [])
+    except Exception:
+        return []
+
+
+@st.dialog("Image", width="large")
+def show_full_image(path: str):
+    """Modal that displays an image at full size (opened on click)."""
+    if os.path.exists(path):
+        st.image(path, use_container_width=True)
+        with open(path, "rb") as fh:
+            st.download_button("💾 Download", fh.read(), file_name=os.path.basename(path))
+
+
 # --------------------------------------------------------------------------- #
 # Chat persistence
 # --------------------------------------------------------------------------- #
@@ -310,17 +327,46 @@ def sidebar():
 
         # --- Model ---
         st.subheader("🧠 Model")
-        labels = [p[0] for p in MODEL_PRESETS]
-        choice = st.selectbox("Model", labels, index=0)
-        preset = MODEL_PRESETS[labels.index(choice)]
-        is_custom = preset[1] == ""
-        if is_custom:
-            model_id = st.text_input("Custom repo id", ss.get("custom_model", ""))
+        if "cached_models" not in ss:
+            ss.cached_models = fetch_cached()
+        cached = ss.cached_models
+        cached_ids = [c["repo_id"] for c in cached]
+
+        # Recommended quick-loads (the paths that are actually good on a 3090).
+        RECOMMENDED = {
+            "⚡ Qwen 2511 (GGUF Q6_K) — recommended": ("Qwen/Qwen-Image-Edit-2511", "gguf", "Q6_K"),
+            "Qwen 2511 (GGUF Q5_K_M, less VRAM)": ("Qwen/Qwen-Image-Edit-2511", "gguf", "Q5_K_M"),
+            "Qwen 2509 (4-bit)": ("Qwen/Qwen-Image-Edit-2509", "4bit", ""),
+        }
+
+        source = st.radio(
+            "Model source",
+            ["Cached on server", "Recommended", "New HF repo"],
+            index=0 if cached_ids else 1,
+        )
+        model_id, precision, gguf_quant = "", "4bit", ""
+        # Only the quantizations WE apply on the fly — GGUF is auto-selected when
+        # the chosen repo is itself a GGUF re-upload (see below), never offered
+        # for models that can't use it.
+        OUR_PRECISIONS = ["4bit", "8bit", "bf16"]
+
+        if source == "Cached on server":
+            if cached_ids:
+                model_id = st.selectbox("Downloaded models", cached_ids)
+            else:
+                st.caption("Nothing cached yet — use Recommended or New HF repo.")
+            precision = st.selectbox("Quantization (applied by us)", OUR_PRECISIONS, index=0)
+        elif source == "Recommended":
+            rlabel = st.selectbox("Recommended", list(RECOMMENDED.keys()))
+            model_id, precision, gguf_quant = RECOMMENDED[rlabel]
+        else:  # New HF repo
+            model_id = st.text_input("Hugging Face repo id (e.g. org/model)", ss.get("custom_model", ""))
             ss.custom_model = model_id
-            precision = st.selectbox("Precision", ["gguf", "4bit", "8bit", "bf16", "max"], index=1)
-            gguf_quant = "Q6_K"
-        else:
-            model_id, precision, gguf_quant = preset[1], preset[2], preset[3]
+            precision = st.selectbox("Quantization (applied by us)", OUR_PRECISIONS, index=0)
+
+        # A GGUF re-upload is loaded with gguf precision automatically.
+        if model_id and "gguf" in model_id.lower() and precision != "gguf":
+            precision, gguf_quant = "gguf", (gguf_quant or "Q6_K")
 
         lora = st.text_input("LoRA (URL/repo, optional)", ss.get("lora", ""))
         ss.lora = lora
@@ -328,15 +374,38 @@ def sidebar():
         ss.lora_scale = lora_scale
 
         status_box = st.empty()
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         if c1.button("⬇️ Load", use_container_width=True):
-            action_load_model(model_id, precision, gguf_quant, lora, lora_scale, status_box)
+            if not model_id:
+                status_box.error("Pick or enter a model first.")
+            else:
+                action_load_model(model_id, precision, gguf_quant, lora, lora_scale, status_box)
+                ss.cached_models = fetch_cached()
         if c2.button("⏏ Unload", use_container_width=True):
             try:
                 api_post("/model/unload").raise_for_status()
                 status_box.info("Model unloaded.")
             except Exception as exc:  # noqa: BLE001
                 status_box.error(str(exc))
+        if c3.button("🔄 Refresh", use_container_width=True):
+            ss.cached_models = fetch_cached()
+            st.rerun()
+
+        # --- Cached models manager (view / delete) ---
+        with st.expander(f"🗂 Downloaded on server ({len(cached)})"):
+            if not cached:
+                st.caption("None found (or server unreachable).")
+            for c in cached:
+                mc = st.columns([0.6, 0.22, 0.18])
+                mc[0].write(c["repo_id"])
+                mc[1].caption(c.get("size_str", ""))
+                if mc[2].button("🗑", key=f"delc_{c['repo_id']}"):
+                    try:
+                        api_post("/cache/delete", json={"repo_id": c["repo_id"]}).raise_for_status()
+                        ss.cached_models = fetch_cached()
+                        st.rerun()
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(str(exc))
 
         with st.expander("🎨 LoRA on loaded model"):
             lc1, lc2 = st.columns(2)
@@ -372,18 +441,19 @@ def render_messages(chat: dict):
                 st.write(msg["text"])
             imgs = [p for p in msg.get("images", []) if os.path.exists(p)]
             if imgs:
-                cols = st.columns(min(len(imgs), 3))
+                # Thumbnails at a contained width in a fixed 3-column grid, so a
+                # big image never stretches the chat.
+                cols = st.columns(3)
                 for i, p in enumerate(imgs):
-                    with cols[i % len(cols)]:
-                        st.image(p, use_container_width=True)
+                    with cols[i % 3]:
+                        st.image(p, width=220)
+                        if st.button("🔍 View", key=f"view_{msg['role']}_{p}"):
+                            show_full_image(p)   # opens a modal at full size
                         if msg["role"] == "assistant":
                             if st.button("↩ Use as input", key=f"use_{p}"):
                                 if p not in st.session_state.pending:
                                     st.session_state.pending.append(p)
                                 st.rerun()
-                            with open(p, "rb") as fh:
-                                st.download_button("💾 Download", fh.read(),
-                                                   file_name=os.path.basename(p), key=f"dl_{p}")
             if msg.get("error"):
                 st.error(msg["error"])
 
@@ -394,11 +464,11 @@ def input_area(chat: dict):
     # Pending input previews (queued images for the next prompt).
     if ss.pending:
         st.caption("Attached inputs for the next prompt:")
-        cols = st.columns(min(len(ss.pending), 6))
+        cols = st.columns(6)
         for i, p in enumerate(list(ss.pending)):
-            with cols[i % len(cols)]:
+            with cols[i % 6]:
                 if os.path.exists(p):
-                    st.image(p, use_container_width=True)
+                    st.image(p, width=110)
                 if st.button("✖", key=f"rm_{i}_{p}"):
                     ss.pending.remove(p)
                     st.rerun()
